@@ -11,7 +11,7 @@ function stateFile(userDataDir) {
 }
 
 function defaultState() {
-  return { repos: [], activeRepoId: null, activeSessionByRepo: {} };
+  return { repos: [], activeRepoId: null, activeSessionByRepo: {}, sidebarWidth: 210 };
 }
 
 function loadState(userDataDir) {
@@ -23,6 +23,7 @@ function loadState(userDataDir) {
       repos: parsed.repos,
       activeRepoId: parsed.activeRepoId ?? null,
       activeSessionByRepo: parsed.activeSessionByRepo ?? {},
+      sidebarWidth: parsed.sidebarWidth ?? 210,
     };
   } catch {
     return defaultState();

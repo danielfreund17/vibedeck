@@ -176,6 +176,26 @@ body {
   padding: 8px;
 }
 
+/* ---- draggable divider between sidebar and terminals ---- */
+.resizer {
+  width: 6px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  background: transparent;
+  transition: background 0.12s ease;
+}
+.resizer:hover,
+body.resizing .resizer {
+  background: var(--accent);
+}
+body.resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+body.resizing .terminals {
+  pointer-events: none;
+}
+
 /* ---- main: terminals ---- */
 .main {
   flex: 1;

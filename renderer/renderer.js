@@ -7,7 +7,7 @@
 
 const api = window.api;
 
-let state = { repos: [], activeRepoId: null, activeSessionByRepo: {} };
+let state = { repos: [], activeRepoId: null, activeSessionByRepo: {}, sidebarWidth: 210 };
 let liveSlugs = new Set(); // tmux sessions alive on our socket right now
 let hostname = ''; // used to ignore tmux's default (hostname) pane title
 
@@ -21,6 +21,7 @@ const el = {
   sidebar: document.getElementById('sidebar'),
   terminals: document.getElementById('terminals'),
   empty: document.getElementById('empty'),
+  resizer: document.getElementById('resizer'),
 };
 
 // ---------- helpers ----------
@@ -401,7 +402,8 @@ async function mountActive() {
 }
 
 // ---------- global events ----------
-window.addEventListener('resize', () => {
+// Refit the visible terminal to its container and tell the pty the new size.
+function fitActive() {
   const repo = activeRepo();
   const sid = repo ? activeSessionId(repo.id) : null;
   const entry = sid ? terminals.get(sid) : null;
@@ -412,7 +414,52 @@ window.addEventListener('resize', () => {
     /* noop */
   }
   api.resizeSession(entry.ptyId, entry.term.cols, entry.term.rows);
-});
+}
+
+window.addEventListener('resize', fitActive);
+
+// Draggable divider: resize the sidebar, persist the width, refit live.
+function applySidebarWidth() {
+  const w = Math.max(140, Math.min(900, state.sidebarWidth || 210));
+  el.sidebar.style.width = w + 'px';
+}
+
+function initResizer() {
+  let startX = 0;
+  let startW = 0;
+  let dragging = false;
+  let raf = null;
+
+  el.resizer.addEventListener('mousedown', (e) => {
+    dragging = true;
+    startX = e.clientX;
+    startW = el.sidebar.getBoundingClientRect().width;
+    document.body.classList.add('resizing');
+    e.preventDefault();
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const max = Math.min(900, window.innerWidth - 240);
+    const w = Math.max(140, Math.min(max, startW + (e.clientX - startX)));
+    state.sidebarWidth = Math.round(w);
+    el.sidebar.style.width = state.sidebarWidth + 'px';
+    if (!raf) {
+      raf = requestAnimationFrame(() => {
+        raf = null;
+        fitActive();
+      });
+    }
+  });
+
+  window.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove('resizing');
+    persist();
+    fitActive();
+  });
+}
 
 window.addEventListener('keydown', (e) => {
   if (!e.metaKey) return;
@@ -471,6 +518,8 @@ async function init() {
   const loaded = await api.loadState();
   if (loaded && Array.isArray(loaded.repos)) state = loaded;
   liveSlugs = new Set(await api.listSessions());
+  applySidebarWidth();
+  initResizer();
   render();
 }
 
