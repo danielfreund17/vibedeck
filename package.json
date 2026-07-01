@@ -1,0 +1,24 @@
+{
+  "name": "vibedeck",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A lean terminal organized in two dimensions: project scopes (top) and persistent tmux-backed sessions (side).",
+  "license": "MIT",
+  "author": "Daniel Freund",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "rebuild": "electron-rebuild -f -w node-pty",
+    "vendor": "node scripts/copy-vendor.js",
+    "postinstall": "electron-rebuild -f -w node-pty && node scripts/copy-vendor.js"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "node-pty": "^1.0.0"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.7.1",
+    "electron": "^33.2.0"
+  }
+}
