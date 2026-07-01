@@ -18,4 +18,5 @@ contextBridge.exposeInMainWorld('api', {
 
   onData: (cb) => ipcRenderer.on('session:data', (_e, payload) => cb(payload)),
   onExit: (cb) => ipcRenderer.on('session:exit', (_e, payload) => cb(payload)),
+  onMenu: (cb) => ipcRenderer.on('menu-action', (_e, action) => cb(action)),
 });

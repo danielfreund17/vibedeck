@@ -680,72 +680,9 @@ function initResizer() {
   });
 }
 
-window.addEventListener('keydown', (e) => {
-  if (!e.metaKey) return;
-  if (paletteEl) return; // the palette handles its own keys while open
-  const repo = activeRepo();
-
-  // ⌘⌥ + arrows navigate the grid: ←/→ across scopes, ↑/↓ through sessions.
-  if (e.altKey) {
-    if (e.key === 'ArrowLeft') {
-      e.preventDefault();
-      cycleRepo(-1);
-      return;
-    }
-    if (e.key === 'ArrowRight') {
-      e.preventDefault();
-      cycleRepo(1);
-      return;
-    }
-    if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      cycleSession(-1);
-      return;
-    }
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      cycleSession(1);
-      return;
-    }
-  }
-
-  // ⌘P — open the repo command palette
-  if (e.key === 'p') {
-    e.preventDefault();
-    openPalette();
-    return;
-  }
-
-  // ⌘⇧[ / ⌘⇧] — previous / next session (up / down the session list).
-  // Match on the physical bracket key so Shift's char remap ([ -> {) is moot.
-  if (e.shiftKey) {
-    const isLeft = e.code === 'BracketLeft' || e.key === '[' || e.key === '{';
-    const isRight = e.code === 'BracketRight' || e.key === ']' || e.key === '}';
-    if (isLeft) {
-      e.preventDefault();
-      cycleSession(-1);
-      return;
-    }
-    if (isRight) {
-      e.preventDefault();
-      cycleSession(1);
-      return;
-    }
-  }
-
-  if (e.key === 't') {
-    if (repo) {
-      e.preventDefault();
-      addSession(repo.id);
-    }
-  } else if (/^[1-9]$/.test(e.key)) {
-    const s = repo?.sessions[Number(e.key) - 1];
-    if (s) {
-      e.preventDefault();
-      selectSession(repo.id, s.id);
-    }
-  }
-});
+// All keyboard shortcuts are handled in the main process (before-input-event)
+// and arrive via api.onMenu above — the only place that reliably catches keys
+// Chromium/xterm would otherwise claim (⌘P / ⌘T / ⌘1-9 / ⌘⌥ arrows / ⌘⇧[ ]).
 
 // ---------- init ----------
 async function init() {
@@ -758,6 +695,23 @@ async function init() {
     const sessionId = ptyToSession.get(ptyId);
     const entry = sessionId && terminals.get(sessionId);
     if (entry) entry.term.write('\r\n\x1b[90m[process exited — reopen to restart]\x1b[0m\r\n');
+  });
+
+  // Shortcuts routed from the native menu (main process).
+  api.onMenu((action) => {
+    if (paletteEl && action !== 'palette') return;
+    const repo = activeRepo();
+    if (action === 'palette') openPalette();
+    else if (action === 'new-session') {
+      if (repo) addSession(repo.id);
+    } else if (action === 'prev-scope') cycleRepo(-1);
+    else if (action === 'next-scope') cycleRepo(1);
+    else if (action === 'prev-session') cycleSession(-1);
+    else if (action === 'next-session') cycleSession(1);
+    else if (action.startsWith('session:')) {
+      const s = repo?.sessions[Number(action.slice(8)) - 1];
+      if (s) selectSession(repo.id, s.id);
+    }
   });
 
   try {

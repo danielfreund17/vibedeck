@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Menu } = require('electron');
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
@@ -66,11 +66,78 @@ function createWindow() {
     },
   });
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+
+  // App keyboard shortcuts, handled before the page so Chromium/xterm can't
+  // claim them (⌘P, ⌘T, ⌘1-9, ⌘⌥ arrows, ⌘⇧[ ]). Dispatched to the renderer
+  // via the same "menu-action" channel the menu items use.
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown' || !input.meta) return;
+    let action = null;
+    if (input.shift) {
+      // brackets = horizontal (scopes); ; ' = vertical (sessions)
+      if (input.code === 'BracketLeft') action = 'prev-scope';
+      else if (input.code === 'BracketRight') action = 'next-scope';
+      else if (input.code === 'Quote') action = 'prev-session';
+      else if (input.code === 'Backslash') action = 'next-session';
+    } else {
+      const k = (input.key || '').toLowerCase();
+      if (k === 'p') action = 'palette';
+      else if (k === 't') action = 'new-session';
+      else if (/^[1-9]$/.test(input.key)) action = `session:${input.key}`;
+    }
+    if (action) {
+      event.preventDefault();
+      sendMenu(action);
+    }
+  });
+}
+
+function sendMenu(action) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('menu-action', action);
+  }
+}
+
+// A native menu owns the app shortcuts. Menu accelerators are handled before
+// the web contents, so keys Chromium would otherwise claim (⌘P, ⌘T, ⌘1-9,
+// ⌘⌥ arrows) reliably reach the app even when the terminal is focused.
+function buildMenu() {
+  const item = (label, accelerator, action) => ({
+    label,
+    accelerator,
+    registerAccelerator: false, // show the shortcut, but let before-input-event own it
+    click: () => sendMenu(action),
+  });
+  const jump = [];
+  for (let i = 1; i <= 9; i++) jump.push(item(`Session ${i}`, `Cmd+${i}`, `session:${i}`));
+
+  const template = [
+    { role: 'appMenu' },
+    { role: 'editMenu' },
+    {
+      label: 'Go',
+      submenu: [
+        item('Command Palette', 'Cmd+P', 'palette'),
+        item('New Session', 'Cmd+T', 'new-session'),
+        { type: 'separator' },
+        item('Previous Scope', 'Cmd+Shift+[', 'prev-scope'),
+        item('Next Scope', 'Cmd+Shift+]', 'next-scope'),
+        item('Previous Session', "Cmd+Shift+'", 'prev-session'),
+        item('Next Session', 'Cmd+Shift+\\', 'next-session'),
+        { type: 'separator' },
+        { label: 'Jump to Session', submenu: jump },
+      ],
+    },
+    { role: 'viewMenu' },
+    { role: 'windowMenu' },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
 app.whenReady().then(async () => {
   await tmux.initServer(userDataDir());
   createWindow();
+  buildMenu();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

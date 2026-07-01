@@ -58,9 +58,8 @@ Electron renderer (UI)  ──IPC──►  main process  ──►  node-pty  �
 - `⌘P` — open the repo palette (search repos under your parent folders, open as a tab)
 - `⌘T` — new session in the active scope
 - `⌘1`–`⌘9` — jump to a session in the active scope
-- `⌘⇧[` / `⌘⇧]` — previous / next session (moves up / down the session list)
-- `⌘⌥←` / `⌘⌥→` — previous / next scope (the top bar)
-- `⌘⌥↑` / `⌘⌥↓` — previous / next session (spatial alias of `⌘⇧[` / `⌘⇧]`)
+- `⌘⇧[` / `⌘⇧]` — previous / next scope (the top bar)
+- `⌘⇧'` / `⌘⇧\` — previous / next session (the side bar)
 - Double-click a scope or session name to rename it
 
 ## Roadmap
