@@ -10,6 +10,8 @@
     "start": "electron .",
     "rebuild": "electron-rebuild -f -w node-pty",
     "vendor": "node scripts/copy-vendor.js",
+    "icon": "bash scripts/build-icon.sh",
+    "dist": "npm run vendor && electron-builder --mac --arm64",
     "postinstall": "electron-rebuild -f -w node-pty && node scripts/copy-vendor.js"
   },
   "dependencies": {
@@ -19,6 +21,24 @@
   },
   "devDependencies": {
     "@electron/rebuild": "^3.7.1",
-    "electron": "^33.2.0"
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.danielfreund.vibedeck",
+    "productName": "VibeDeck",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "asarUnpack": [
+      "**/node_modules/node-pty/**"
+    ],
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
+      "identity": null
+    }
   }
 }

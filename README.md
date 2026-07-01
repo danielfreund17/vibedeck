@@ -24,6 +24,15 @@ npm start
 
 Open a repo as a scope with `⌘P` (or the `+` in the top bar): register a **parent folder** like `~/git-repos` once, then fuzzy-search the git repos under it and press Enter to open one as a tab. You can also open any folder manually. Then add sessions with **+ New session** in the side bar.
 
+## Build a macOS app
+
+```bash
+npm run icon   # (re)generate build/icon.icns from build/icon.svg — optional
+npm run dist   # -> dist/VibeDeck-<version>-arm64.dmg  (unsigned)
+```
+
+Open the `.dmg` and drag **VibeDeck** to Applications. The build is **unsigned**, so if macOS blocks the first launch, right-click the app → **Open** once, or run `xattr -dr com.apple.quarantine /Applications/VibeDeck.app`. (A locally built copy isn't quarantined, so this is only needed for a downloaded `.dmg`.) Requires `tmux` installed.
+
 ## How it works
 
 ```

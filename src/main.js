@@ -8,6 +8,9 @@ const fs = require('fs');
 const state = require('./state');
 const tmux = require('./tmux');
 
+// Keep dev (`npm start`) and the packaged .app pointed at the same state/config.
+app.setPath('userData', path.join(app.getPath('appData'), 'vibedeck'));
+
 let mainWindow = null;
 
 // ptyId -> { proc, slug }. ptyId is per-attach (a live client); slug is the
