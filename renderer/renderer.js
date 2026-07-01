@@ -223,6 +223,17 @@ async function selectSession(repoId, sessionId) {
   render();
 }
 
+// Move up (-1) / down (+1) the active scope's session list, wrapping around.
+function cycleSession(dir) {
+  const repo = activeRepo();
+  if (!repo || repo.sessions.length === 0) return;
+  let idx = repo.sessions.findIndex((s) => s.id === activeSessionId(repo.id));
+  if (idx === -1) idx = 0;
+  const n = repo.sessions.length;
+  const nextIdx = (idx + dir + n) % n;
+  selectSession(repo.id, repo.sessions[nextIdx].id);
+}
+
 // ---------- terminal lifecycle ----------
 async function ensureTerminal(repo, session) {
   const existing = terminals.get(session.id);
@@ -406,6 +417,24 @@ window.addEventListener('resize', () => {
 window.addEventListener('keydown', (e) => {
   if (!e.metaKey) return;
   const repo = activeRepo();
+
+  // ⌘⇧[ / ⌘⇧] — previous / next session (up / down the session list).
+  // Match on the physical bracket key so Shift's char remap ([ -> {) is moot.
+  if (e.shiftKey) {
+    const isLeft = e.code === 'BracketLeft' || e.key === '[' || e.key === '{';
+    const isRight = e.code === 'BracketRight' || e.key === ']' || e.key === '}';
+    if (isLeft) {
+      e.preventDefault();
+      cycleSession(-1);
+      return;
+    }
+    if (isRight) {
+      e.preventDefault();
+      cycleSession(1);
+      return;
+    }
+  }
+
   if (e.key === 't') {
     if (repo) {
       e.preventDefault();
