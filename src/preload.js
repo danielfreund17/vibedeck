@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('api', {
   saveState: (s) => ipcRenderer.invoke('state:save', s),
   pickFolder: () => ipcRenderer.invoke('dialog:pickFolder'),
   listSessions: () => ipcRenderer.invoke('tmux:listSessions'),
+  scanRepos: (parents) => ipcRenderer.invoke('repos:scan', parents),
 
   startSession: (opts) => ipcRenderer.invoke('session:start', opts),
   killSession: (slug, ptyId) => ipcRenderer.invoke('session:kill', { slug, ptyId }),

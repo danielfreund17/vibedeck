@@ -4,6 +4,7 @@ const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
+const fs = require('fs');
 const state = require('./state');
 const tmux = require('./tmux');
 
@@ -15,6 +16,34 @@ const ptys = new Map();
 
 function userDataDir() {
   return app.getPath('userData');
+}
+
+// Scan registered parent folders one level deep for git repositories.
+function scanRepos(parentFolders) {
+  const out = [];
+  const seen = new Set();
+  for (const parent of Array.isArray(parentFolders) ? parentFolders : []) {
+    let entries;
+    try {
+      entries = fs.readdirSync(parent, { withFileTypes: true });
+    } catch {
+      continue; // unreadable / removed folder
+    }
+    for (const ent of entries) {
+      if (!ent.isDirectory()) continue;
+      const full = path.join(parent, ent.name);
+      try {
+        fs.accessSync(path.join(full, '.git'));
+      } catch {
+        continue; // not a git repo
+      }
+      if (seen.has(full)) continue;
+      seen.add(full);
+      out.push({ name: ent.name, path: full, parent });
+    }
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
 }
 
 function createWindow() {
@@ -60,7 +89,7 @@ app.on('before-quit', () => {
 });
 
 // ---- app info ----
-ipcMain.handle('app:info', () => ({ hostname: os.hostname() }));
+ipcMain.handle('app:info', () => ({ hostname: os.hostname(), homedir: os.homedir() }));
 
 // ---- state ----
 ipcMain.handle('state:load', () => state.loadState(userDataDir()));
@@ -82,6 +111,9 @@ ipcMain.handle('dialog:pickFolder', async () => {
 
 // ---- tmux discovery (reconciliation on launch) ----
 ipcMain.handle('tmux:listSessions', () => tmux.listSessions());
+
+// ---- repo discovery under registered parent folders ----
+ipcMain.handle('repos:scan', (_e, parentFolders) => scanRepos(parentFolders));
 
 // ---- sessions ----
 ipcMain.handle('session:start', (_e, { slug, cwd, cols, rows }) => {

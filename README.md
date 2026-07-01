@@ -22,7 +22,7 @@ npm install     # installs deps, rebuilds node-pty for Electron, vendors xterm a
 npm start
 ```
 
-Add a scope with the `+` in the top bar (pick a folder), then add sessions with **+ New session** in the side bar.
+Open a repo as a scope with `⌘P` (or the `+` in the top bar): register a **parent folder** like `~/git-repos` once, then fuzzy-search the git repos under it and press Enter to open one as a tab. You can also open any folder manually. Then add sessions with **+ New session** in the side bar.
 
 ## How it works
 
@@ -37,6 +37,7 @@ Electron renderer (UI)  ──IPC──►  main process  ──►  node-pty  �
 
 ## Keyboard
 
+- `⌘P` — open the repo palette (search repos under your parent folders, open as a tab)
 - `⌘T` — new session in the active scope
 - `⌘1`–`⌘9` — jump to a session in the active scope
 - `⌘⇧[` / `⌘⇧]` — previous / next session (moves up / down the session list)

@@ -7,9 +7,17 @@
 
 const api = window.api;
 
-let state = { repos: [], activeRepoId: null, activeSessionByRepo: {}, sidebarWidth: 210 };
+let state = {
+  repos: [],
+  activeRepoId: null,
+  activeSessionByRepo: {},
+  sidebarWidth: 210,
+  parentFolders: [],
+};
 let liveSlugs = new Set(); // tmux sessions alive on our socket right now
 let hostname = ''; // used to ignore tmux's default (hostname) pane title
+let homedir = ''; // used to prettify paths (~/...)
+let paletteEl = null; // the open command-palette overlay, if any
 
 // sessionId -> { term, fit, ptyId, el }
 const terminals = new Map();
@@ -116,14 +124,212 @@ function promptModal(title, defaultValue = '') {
 }
 
 // ---------- mutations ----------
-async function addRepo() {
-  const picked = await api.pickFolder();
-  if (!picked) return;
-  const repo = { id: uid(), name: picked.name, cwd: picked.path, sessions: [] };
+// Open a repo folder as a scope tab; focus it if it's already open.
+async function openRepoScope(cwd, name) {
+  const existing = state.repos.find((r) => r.cwd === cwd);
+  if (existing) {
+    await selectRepo(existing.id);
+    return;
+  }
+  const repo = { id: uid(), name, cwd, sessions: [] };
   state.repos.push(repo);
   state.activeRepoId = repo.id;
   await persist();
   render();
+}
+
+function prettyPath(p) {
+  return homedir && p.startsWith(homedir) ? '~' + p.slice(homedir.length) : p;
+}
+
+// Fuzzy score: prefix > substring > subsequence; -Infinity means no match.
+function fuzzyScore(name, q) {
+  if (!q) return 0;
+  const idx = name.indexOf(q);
+  if (idx === 0) return 1000 - name.length;
+  if (idx > 0) return 600 - idx;
+  let qi = 0;
+  for (let i = 0; i < name.length && qi < q.length; i++) {
+    if (name[i] === q[qi]) qi++;
+  }
+  return qi === q.length ? 200 - name.length : -Infinity;
+}
+
+// Command palette (⌘P / the + button): search git repos under registered
+// parent folders and open one as a scope tab.
+let paletteRepos = [];
+async function openPalette() {
+  if (paletteEl) return;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay palette-overlay';
+  overlay.innerHTML = `
+    <div class="palette">
+      <input class="palette-input" type="text" placeholder="Search repos…  (⏎ open · esc close)" spellcheck="false" />
+      <div class="palette-list"></div>
+      <div class="palette-actions">
+        <button class="palette-action" data-act="add-parent">+ Add parent folder…</button>
+        <button class="palette-action" data-act="open-folder">📁 Open other folder…</button>
+      </div>
+      <div class="palette-sources"></div>
+    </div>`;
+  paletteEl = overlay;
+
+  const input = overlay.querySelector('.palette-input');
+  const listEl = overlay.querySelector('.palette-list');
+  const sourcesEl = overlay.querySelector('.palette-sources');
+  const openCwds = new Set(state.repos.map((r) => r.cwd));
+
+  let items = [];
+  let sel = 0;
+
+  function computeItems() {
+    const q = input.value.trim().toLowerCase();
+    items = !q
+      ? paletteRepos.slice()
+      : paletteRepos
+          .map((r) => ({ r, s: fuzzyScore(r.name.toLowerCase(), q) }))
+          .filter((x) => x.s > -Infinity)
+          .sort((a, b) => b.s - a.s)
+          .map((x) => x.r);
+    if (sel >= items.length) sel = Math.max(0, items.length - 1);
+  }
+
+  function highlight() {
+    [...listEl.children].forEach((c, i) => c.classList.toggle('active', i === sel));
+    listEl.children[sel]?.scrollIntoView({ block: 'nearest' });
+  }
+
+  function renderList() {
+    listEl.innerHTML = '';
+    if (!paletteRepos.length) {
+      const d = document.createElement('div');
+      d.className = 'palette-empty';
+      d.textContent = 'No repos yet. Add a parent folder (like ~/git-repos) below.';
+      listEl.appendChild(d);
+      return;
+    }
+    if (!items.length) {
+      const d = document.createElement('div');
+      d.className = 'palette-empty';
+      d.textContent = 'No match.';
+      listEl.appendChild(d);
+      return;
+    }
+    items.forEach((r, i) => {
+      const row = document.createElement('div');
+      row.className = 'palette-item' + (i === sel ? ' active' : '');
+      const nm = document.createElement('span');
+      nm.className = 'pi-name';
+      nm.textContent = r.name;
+      const pa = document.createElement('span');
+      pa.className = 'pi-path';
+      pa.textContent = openCwds.has(r.path) ? '• already open' : prettyPath(r.parent);
+      row.append(nm, pa);
+      row.onmouseenter = () => {
+        sel = i;
+        highlight();
+      };
+      row.onclick = () => choose(r);
+      listEl.appendChild(row);
+    });
+  }
+
+  function renderSources() {
+    sourcesEl.innerHTML = '';
+    (state.parentFolders || []).forEach((p) => {
+      const chip = document.createElement('span');
+      chip.className = 'source-chip';
+      const label = document.createElement('span');
+      label.textContent = prettyPath(p);
+      const x = document.createElement('button');
+      x.textContent = '×';
+      x.title = 'Remove source';
+      x.onclick = (e) => {
+        e.stopPropagation();
+        removeParent(p);
+      };
+      chip.append(label, x);
+      sourcesEl.appendChild(chip);
+    });
+  }
+
+  async function rescan() {
+    paletteRepos = await api.scanRepos(state.parentFolders || []);
+    computeItems();
+    renderList();
+    renderSources();
+  }
+
+  async function choose(r) {
+    close();
+    await openRepoScope(r.path, r.name);
+  }
+
+  function close() {
+    overlay.remove();
+    paletteEl = null;
+    document.removeEventListener('keydown', onKey, true);
+  }
+
+  function onKey(e) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      close();
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (items.length) {
+        sel = (sel + 1) % items.length;
+        highlight();
+      }
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (items.length) {
+        sel = (sel - 1 + items.length) % items.length;
+        highlight();
+      }
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (items[sel]) choose(items[sel]);
+    }
+  }
+
+  async function removeParent(p) {
+    state.parentFolders = (state.parentFolders || []).filter((x) => x !== p);
+    await persist();
+    await rescan();
+    input.focus();
+  }
+
+  input.addEventListener('input', () => {
+    computeItems();
+    renderList();
+  });
+  overlay.addEventListener('mousedown', (e) => {
+    if (e.target === overlay) close();
+  });
+
+  overlay.querySelector('[data-act=add-parent]').onclick = async () => {
+    const picked = await api.pickFolder();
+    if (!picked) return;
+    if (!Array.isArray(state.parentFolders)) state.parentFolders = [];
+    if (!state.parentFolders.includes(picked.path)) state.parentFolders.push(picked.path);
+    await persist();
+    await rescan();
+    input.focus();
+  };
+
+  overlay.querySelector('[data-act=open-folder]').onclick = async () => {
+    const picked = await api.pickFolder();
+    if (!picked) return;
+    close();
+    await openRepoScope(picked.path, picked.name);
+  };
+
+  document.addEventListener('keydown', onKey, true);
+  document.body.appendChild(overlay);
+  input.focus();
+  await rescan();
 }
 
 async function renameRepo(repoId) {
@@ -316,8 +522,8 @@ function renderTopbar() {
   const add = document.createElement('button');
   add.className = 'chip chip-add';
   add.textContent = '+';
-  add.title = 'Add scope (choose a folder)';
-  add.onclick = addRepo;
+  add.title = 'Open a repo (⌘P)';
+  add.onclick = openPalette;
   el.topbar.appendChild(add);
 }
 
@@ -463,7 +669,15 @@ function initResizer() {
 
 window.addEventListener('keydown', (e) => {
   if (!e.metaKey) return;
+  if (paletteEl) return; // the palette handles its own keys while open
   const repo = activeRepo();
+
+  // ⌘P — open the repo command palette
+  if (e.key === 'p') {
+    e.preventDefault();
+    openPalette();
+    return;
+  }
 
   // ⌘⇧[ / ⌘⇧] — previous / next session (up / down the session list).
   // Match on the physical bracket key so Shift's char remap ([ -> {) is moot.
@@ -510,7 +724,9 @@ async function init() {
   });
 
   try {
-    hostname = (await api.hostInfo()).hostname || '';
+    const info = await api.hostInfo();
+    hostname = info.hostname || '';
+    homedir = info.homedir || '';
   } catch {
     /* non-fatal */
   }
