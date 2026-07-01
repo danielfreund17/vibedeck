@@ -468,6 +468,9 @@ async function ensureTerminal(repo, session) {
     scrollback: 10000,
     theme: { background: '#0e0f13', foreground: '#e6e6e6', cursor: '#6d8cff' },
   });
+  // Let VibeDeck's ⌘ shortcuts reach the window handler. Without this, xterm
+  // consumes arrow keys (it cancels them), so ⌘⌥←/→ never bubbles up.
+  term.attachCustomKeyEventHandler((e) => !e.metaKey);
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(wrap);
