@@ -3,6 +3,7 @@
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 const state = require('./state');
 const tmux = require('./tmux');
 
@@ -35,7 +36,8 @@ function createWindow() {
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  await tmux.initServer(userDataDir());
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -56,6 +58,9 @@ app.on('before-quit', () => {
     }
   }
 });
+
+// ---- app info ----
+ipcMain.handle('app:info', () => ({ hostname: os.hostname() }));
 
 // ---- state ----
 ipcMain.handle('state:load', () => state.loadState(userDataDir()));

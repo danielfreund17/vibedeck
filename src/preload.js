@@ -4,6 +4,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 // The only surface the renderer can touch. No Node, no direct pty access.
 contextBridge.exposeInMainWorld('api', {
+  hostInfo: () => ipcRenderer.invoke('app:info'),
   loadState: () => ipcRenderer.invoke('state:load'),
   saveState: (s) => ipcRenderer.invoke('state:save', s),
   pickFolder: () => ipcRenderer.invoke('dialog:pickFolder'),

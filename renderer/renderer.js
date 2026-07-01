@@ -9,6 +9,7 @@ const api = window.api;
 
 let state = { repos: [], activeRepoId: null, activeSessionByRepo: {} };
 let liveSlugs = new Set(); // tmux sessions alive on our socket right now
+let hostname = ''; // used to ignore tmux's default (hostname) pane title
 
 // sessionId -> { term, fit, ptyId, el }
 const terminals = new Map();
@@ -31,6 +32,42 @@ function newSlug() {
 }
 function persist() {
   return api.saveState(state);
+}
+
+// Debounced save for high-frequency updates (auto-title changes).
+let persistTimer = null;
+function persistSoon() {
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    api.saveState(state);
+  }, 400);
+}
+
+// Auto-naming: a session's display name follows the terminal title the running
+// program sets (e.g. Claude Code), unless the user pinned a name. Filters out
+// tmux's default (hostname) title and bare/idle shell titles so they don't
+// clobber a meaningful name.
+function cleanAutoTitle(raw) {
+  const t = (raw || '').trim();
+  if (!t) return null;
+  if (hostname && t === hostname) return null; // tmux's default pane title
+  if (/^-?(zsh|bash|sh|fish|dash|tcsh|ksh)$/i.test(t)) return null; // idle shell
+  if (/^[^\s@]+@[^\s:]+:/.test(t)) return null; // user@host:path idle title
+  return t.length > 120 ? t.slice(0, 119) + '…' : t;
+}
+
+function applyAutoTitle(session, rawTitle) {
+  if (session.pinned) return;
+  const cleaned = cleanAutoTitle(rawTitle);
+  if (!cleaned || cleaned === session.name) return;
+  session.name = cleaned;
+  const label = document.querySelector(`.session-name[data-sid="${session.id}"]`);
+  if (label) {
+    label.textContent = cleaned;
+    label.title = cleaned;
+  }
+  persistSoon();
 }
 function activeRepo() {
   return state.repos.find((r) => r.id === state.activeRepoId) || null;
@@ -115,7 +152,12 @@ async function removeRepo(repoId) {
 async function addSession(repoId) {
   const repo = state.repos.find((r) => r.id === repoId);
   if (!repo) return;
-  const session = { id: uid(), name: `session ${repo.sessions.length + 1}`, slug: newSlug() };
+  const session = {
+    id: uid(),
+    name: `session ${repo.sessions.length + 1}`,
+    slug: newSlug(),
+    pinned: false,
+  };
   repo.sessions.push(session);
   state.activeRepoId = repoId;
   state.activeSessionByRepo[repoId] = session.id;
@@ -130,6 +172,7 @@ async function renameSession(repoId, sessionId) {
   const name = await promptModal('Rename session', session.name);
   if (name) {
     session.name = name;
+    session.pinned = true; // manual name wins; stop following the auto-title
     await persist();
     render();
   }
@@ -220,6 +263,7 @@ async function ensureTerminal(repo, session) {
 
   term.onData((data) => api.writeSession(ptyId, data));
   term.onResize(({ cols, rows }) => api.resizeSession(ptyId, cols, rows));
+  term.onTitleChange((title) => applyAutoTitle(session, title));
 
   return entry;
 }
@@ -289,7 +333,9 @@ function renderSidebar() {
 
     const name = document.createElement('span');
     name.className = 'session-name';
+    name.dataset.sid = s.id;
     name.textContent = s.name;
+    name.title = s.pinned ? s.name : `${s.name} (auto-named — double-click to rename)`;
     name.onclick = () => selectSession(repo.id, s.id);
     name.ondblclick = () => renameSession(repo.id, s.id);
 
@@ -386,6 +432,12 @@ async function init() {
     const entry = sessionId && terminals.get(sessionId);
     if (entry) entry.term.write('\r\n\x1b[90m[process exited — reopen to restart]\x1b[0m\r\n');
   });
+
+  try {
+    hostname = (await api.hostInfo()).hostname || '';
+  } catch {
+    /* non-fatal */
+  }
 
   const loaded = await api.loadState();
   if (loaded && Array.isArray(loaded.repos)) state = loaded;

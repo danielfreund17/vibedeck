@@ -21,6 +21,8 @@ set -g history-limit 50000
 set -g escape-time 10
 set -g default-terminal "screen-256color"
 set -g status off
+set -g set-titles on
+set -g set-titles-string "#T"
 `;
 
 function confPath(userDataDir) {
@@ -66,6 +68,9 @@ function shellEnv() {
   // Guarantee common bin dirs are present regardless of how the app launched.
   const extra = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'];
   env.PATH = [...new Set([...extra, ...(env.PATH ? env.PATH.split(':') : [])])].join(':');
+  // Let programs (e.g. Claude Code) own the terminal title so VibeDeck can
+  // auto-name sessions; suppress oh-my-zsh's idle title churn for our shells.
+  env.DISABLE_AUTO_TITLE = 'true';
   return env;
 }
 
@@ -114,4 +119,21 @@ function killSession(slug) {
   });
 }
 
-module.exports = { spawnSession, listSessions, killSession, isValidSlug };
+// Ensure the tmux server is running with our options applied, even if it was
+// started earlier (a running server won't re-read the config file on its own).
+function initServer(userDataDir) {
+  const conf = ensureConf(userDataDir);
+  return new Promise((resolve) => {
+    execFile(
+      resolveTmux(),
+      [
+        '-L', SOCKET, '-f', conf, 'start-server',
+        ';', 'set', '-g', 'set-titles', 'on',
+        ';', 'set', '-g', 'set-titles-string', '#T',
+      ],
+      () => resolve()
+    );
+  });
+}
+
+module.exports = { spawnSession, listSessions, killSession, isValidSlug, initServer };
