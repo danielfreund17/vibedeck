@@ -441,6 +441,16 @@ function cycleSession(dir) {
   selectSession(repo.id, repo.sessions[nextIdx].id);
 }
 
+// Move left (-1) / right (+1) across the scope tabs, wrapping around.
+function cycleRepo(dir) {
+  if (state.repos.length === 0) return;
+  let idx = state.repos.findIndex((r) => r.id === state.activeRepoId);
+  if (idx === -1) idx = 0;
+  const n = state.repos.length;
+  const nextIdx = (idx + dir + n) % n;
+  selectRepo(state.repos[nextIdx].id);
+}
+
 // ---------- terminal lifecycle ----------
 async function ensureTerminal(repo, session) {
   const existing = terminals.get(session.id);
@@ -671,6 +681,30 @@ window.addEventListener('keydown', (e) => {
   if (!e.metaKey) return;
   if (paletteEl) return; // the palette handles its own keys while open
   const repo = activeRepo();
+
+  // ⌘⌥ + arrows navigate the grid: ←/→ across scopes, ↑/↓ through sessions.
+  if (e.altKey) {
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      cycleRepo(-1);
+      return;
+    }
+    if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      cycleRepo(1);
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      cycleSession(-1);
+      return;
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      cycleSession(1);
+      return;
+    }
+  }
 
   // ⌘P — open the repo command palette
   if (e.key === 'p') {
