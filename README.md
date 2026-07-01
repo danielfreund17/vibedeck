@@ -26,12 +26,21 @@ Open a repo as a scope with `⌘P` (or the `+` in the top bar): register a **par
 
 ## Build a macOS app
 
+One command — build, install to `/Applications`, and launch:
+
 ```bash
-npm run icon   # (re)generate build/icon.icns from build/icon.svg — optional
-npm run dist   # -> dist/VibeDeck-<version>-arm64.dmg  (unsigned)
+npm run install-app
 ```
 
-Open the `.dmg` and drag **VibeDeck** to Applications. The build is **unsigned**, so if macOS blocks the first launch, right-click the app → **Open** once, or run `xattr -dr com.apple.quarantine /Applications/VibeDeck.app`. (A locally built copy isn't quarantined, so this is only needed for a downloaded `.dmg`.) Requires `tmux` installed.
+Or step by step:
+
+```bash
+npm run icon                  # (re)generate build/icon.icns from build/icon.svg — optional
+npm run dist                  # -> dist/VibeDeck-<version>-arm64.dmg  (unsigned)
+bash scripts/install-app.sh   # copy the built app into /Applications + launch
+```
+
+Prefer to install by hand? Open the `.dmg` and drag **VibeDeck** to Applications. The build is **unsigned**; a *downloaded* copy may be blocked on first launch — right-click the app → **Open** once, or run `xattr -dr com.apple.quarantine /Applications/VibeDeck.app`. (A locally built copy isn't quarantined.) Requires `tmux` installed.
 
 ## How it works
 

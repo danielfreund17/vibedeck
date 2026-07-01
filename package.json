@@ -12,6 +12,7 @@
     "vendor": "node scripts/copy-vendor.js",
     "icon": "bash scripts/build-icon.sh",
     "dist": "npm run vendor && electron-builder --mac --arm64",
+    "install-app": "npm run dist && bash scripts/install-app.sh",
     "postinstall": "electron-rebuild -f -w node-pty && node scripts/copy-vendor.js"
   },
   "dependencies": {
