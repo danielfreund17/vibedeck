@@ -10,6 +10,8 @@ contextBridge.exposeInMainWorld('api', {
   pickFolder: () => ipcRenderer.invoke('dialog:pickFolder'),
   listSessions: () => ipcRenderer.invoke('tmux:listSessions'),
   scanRepos: (parents) => ipcRenderer.invoke('repos:scan', parents),
+  clipWrite: (text) => ipcRenderer.invoke('clipboard:write', text),
+  clipRead: () => ipcRenderer.invoke('clipboard:read'),
 
   startSession: (opts) => ipcRenderer.invoke('session:start', opts),
   killSession: (slug, ptyId) => ipcRenderer.invoke('session:kill', { slug, ptyId }),

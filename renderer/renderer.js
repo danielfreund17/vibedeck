@@ -84,6 +84,11 @@ function activeRepo() {
 function activeSessionId(repoId) {
   return state.activeSessionByRepo[repoId] || null;
 }
+function activeEntry() {
+  const repo = activeRepo();
+  const sid = repo ? activeSessionId(repo.id) : null;
+  return sid ? terminals.get(sid) : null;
+}
 
 // A tiny text-input modal (Electron doesn't implement window.prompt).
 function promptModal(title, defaultValue = '') {
@@ -698,7 +703,7 @@ async function init() {
   });
 
   // Shortcuts routed from the native menu (main process).
-  api.onMenu((action) => {
+  api.onMenu(async (action) => {
     if (paletteEl && action !== 'palette') return;
     const repo = activeRepo();
     if (action === 'palette') openPalette();
@@ -708,7 +713,18 @@ async function init() {
     else if (action === 'next-scope') cycleRepo(1);
     else if (action === 'prev-session') cycleSession(-1);
     else if (action === 'next-session') cycleSession(1);
-    else if (action.startsWith('session:')) {
+    else if (action === 'copy') {
+      const entry = activeEntry();
+      if (entry && entry.term.hasSelection()) api.clipWrite(entry.term.getSelection());
+    } else if (action === 'paste') {
+      const entry = activeEntry();
+      if (entry) {
+        const text = await api.clipRead();
+        if (text) entry.term.paste(text);
+      }
+    } else if (action === 'select-all') {
+      activeEntry()?.term.selectAll();
+    } else if (action.startsWith('session:')) {
       const s = repo?.sessions[Number(action.slice(8)) - 1];
       if (s) selectSession(repo.id, s.id);
     }

@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Menu, clipboard } = require('electron');
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
@@ -142,7 +142,15 @@ function buildMenu() {
 
   const template = [
     { role: 'appMenu' },
-    { role: 'editMenu' },
+    {
+      label: 'Edit',
+      submenu: [
+        { label: 'Copy', accelerator: 'CmdOrCtrl+C', click: () => sendMenu('copy') },
+        { label: 'Paste', accelerator: 'CmdOrCtrl+V', click: () => sendMenu('paste') },
+        { type: 'separator' },
+        { label: 'Select All', accelerator: 'CmdOrCtrl+A', click: () => sendMenu('select-all') },
+      ],
+    },
     {
       label: 'Go',
       submenu: [
@@ -189,6 +197,13 @@ app.on('before-quit', () => {
 
 // ---- app info ----
 ipcMain.handle('app:info', () => ({ hostname: os.hostname(), homedir: os.homedir() }));
+
+// ---- clipboard (xterm manages its own selection, so we copy/paste explicitly) ----
+ipcMain.handle('clipboard:write', (_e, text) => {
+  clipboard.writeText(String(text ?? ''));
+  return true;
+});
+ipcMain.handle('clipboard:read', () => clipboard.readText());
 
 // ---- state ----
 ipcMain.handle('state:load', () => state.loadState(userDataDir()));
