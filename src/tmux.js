@@ -92,43 +92,25 @@ function shellEnv() {
 }
 
 // Spawn a pty running a tmux client attached to `slug` (creating it if needed).
-// The tmux server keeps the shell alive after this client/pty dies.
+// The tmux server keeps the shell alive after this client/pty dies. Returns the
+// pty, whether this call created the session, and the resolved start dir — the
+// caller fixes the cwd only for new sessions (see main.js scheduleInitialCd).
 function spawnSession({ userDataDir, slug, cwd, cols, rows }) {
   if (!isValidSlug(slug)) throw new Error(`invalid session slug: ${slug}`);
   const tmuxBin = resolveTmux();
   const conf = ensureConf(userDataDir);
   const startDir = cwd && dirExists(cwd) ? cwd : os.homedir();
-  const env = shellEnv();
-
-  // Brand-new session: create it detached in startDir and queue a `cd` into the
-  // pane. Buffered input runs *after* the shell's startup files, so the pane
-  // lands in startDir even if the user's shell cd's on launch. Reattaches (e.g.
-  // a session already running an agent) are left untouched.
-  if (!sessionExists(tmuxBin, slug)) {
-    try {
-      execFileSync(
-        tmuxBin,
-        ['-L', SOCKET, '-f', conf, 'new-session', '-d', '-s', slug, '-c', startDir],
-        { env, stdio: 'ignore' }
-      );
-      execFileSync(
-        tmuxBin,
-        ['-L', SOCKET, 'send-keys', '-t', slug, `cd -- ${shellQuote(startDir)} && clear`, 'Enter'],
-        { stdio: 'ignore' }
-      );
-    } catch {
-      /* fall through to attach below */
-    }
-  }
+  const isNew = !sessionExists(tmuxBin, slug);
 
   const args = ['-L', SOCKET, '-f', conf, 'new-session', '-A', '-s', slug, '-c', startDir];
-  return pty.spawn(tmuxBin, args, {
+  const proc = pty.spawn(tmuxBin, args, {
     name: 'xterm-256color',
     cols: cols || 80,
     rows: rows || 24,
     cwd: startDir,
-    env,
+    env: shellEnv(),
   });
+  return { proc, isNew, startDir };
 }
 
 // Exact-match check (the `=` prefix prevents tmux prefix matching).
@@ -141,9 +123,6 @@ function sessionExists(tmuxBin, slug) {
   }
 }
 
-function shellQuote(s) {
-  return `'${String(s).replace(/'/g, `'\\''`)}'`;
-}
 
 // List slugs of sessions currently alive on our socket (for reconciliation).
 function listSessions() {

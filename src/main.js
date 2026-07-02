@@ -100,6 +100,33 @@ function sendMenu(action) {
   }
 }
 
+// After a new session's shell settles at its first prompt (output goes quiet),
+// cd it into the repo. `builtin cd` bypasses shell `cd` wrappers (e.g. RVM's),
+// and waiting for quiet avoids racing shell startup. Only used for new sessions
+// so a reattached (possibly agent-running) pane is never disturbed.
+function scheduleInitialCd(proc, dir) {
+  const quoted = `'${String(dir).replace(/'/g, `'\\''`)}'`;
+  let timer = null;
+  let done = false;
+  const sub = proc.onData(() => {
+    if (done) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      done = true;
+      try {
+        proc.write(`builtin cd -- ${quoted} && clear\r`);
+      } catch {
+        /* pty gone */
+      }
+      try {
+        sub.dispose();
+      } catch {
+        /* noop */
+      }
+    }, 700);
+  });
+}
+
 // A native menu owns the app shortcuts. Menu accelerators are handled before
 // the web contents, so keys Chromium would otherwise claim (⌘P, ⌘T, ⌘1-9,
 // ⌘⌥ arrows) reliably reach the app even when the terminal is focused.
@@ -189,7 +216,7 @@ ipcMain.handle('repos:scan', (_e, parentFolders) => scanRepos(parentFolders));
 
 // ---- sessions ----
 ipcMain.handle('session:start', (_e, { slug, cwd, cols, rows }) => {
-  const proc = tmux.spawnSession({ userDataDir: userDataDir(), slug, cwd, cols, rows });
+  const { proc, isNew, startDir } = tmux.spawnSession({ userDataDir: userDataDir(), slug, cwd, cols, rows });
   const ptyId = crypto.randomUUID();
   ptys.set(ptyId, { proc, slug });
 
@@ -204,6 +231,10 @@ ipcMain.handle('session:start', (_e, { slug, cwd, cols, rows }) => {
       mainWindow.webContents.send('session:exit', { ptyId });
     }
   });
+
+  // Some shells cd on startup (RVM/oh-my-zsh here), overriding tmux -c. For a
+  // new session, once its shell settles at the first prompt, cd into the repo.
+  if (isNew) scheduleInitialCd(proc, startDir);
 
   return { ptyId };
 });
