@@ -88,6 +88,12 @@ function shellEnv() {
   for (const key of Object.keys(env)) {
     if (key === 'CLAUDECODE' || key.startsWith('CLAUDE_CODE_')) delete env[key];
   }
+  // GUI-launched apps don't inherit the shell's locale, leaving a C/POSIX locale
+  // where TUIs (e.g. Claude Code) render box-drawing/glyphs as ASCII garbage.
+  // Ensure a UTF-8 locale, like Terminal.app does.
+  if (![env.LC_ALL, env.LC_CTYPE, env.LANG].some((v) => /utf-?8/i.test(v || ''))) {
+    env.LANG = 'en_US.UTF-8';
+  }
   return env;
 }
 

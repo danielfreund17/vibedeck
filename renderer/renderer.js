@@ -473,9 +473,6 @@ async function ensureTerminal(repo, session) {
     scrollback: 10000,
     theme: { background: '#0e0f13', foreground: '#e6e6e6', cursor: '#6d8cff' },
   });
-  // Let VibeDeck's ⌘ shortcuts reach the window handler. Without this, xterm
-  // consumes arrow keys (it cancels them), so ⌘⌥←/→ never bubbles up.
-  term.attachCustomKeyEventHandler((e) => !e.metaKey);
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(wrap);
@@ -496,6 +493,24 @@ async function ensureTerminal(repo, session) {
   terminals.set(session.id, entry);
   ptyToSession.set(ptyId, session.id);
   liveSlugs.add(session.slug);
+
+  // Shift+Enter inserts a newline (sent as Alt+Enter — ESC+CR — which Claude
+  // Code and most shells treat as a literal newline) instead of submitting.
+  // Also let ⌘ shortcuts bubble to the app (otherwise xterm cancels e.g. arrows).
+  term.attachCustomKeyEventHandler((e) => {
+    if (
+      e.type === 'keydown' &&
+      e.key === 'Enter' &&
+      e.shiftKey &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.altKey
+    ) {
+      api.writeSession(ptyId, '\x1b\r');
+      return false;
+    }
+    return !e.metaKey;
+  });
 
   term.onData((data) => api.writeSession(ptyId, data));
   term.onResize(({ cols, rows }) => api.resizeSession(ptyId, cols, rows));
