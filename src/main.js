@@ -71,15 +71,17 @@ function createWindow() {
   // claim them (⌘P, ⌘T, ⌘1-9, ⌘⌥ arrows, ⌘⇧[ ]). Dispatched to the renderer
   // via the same "menu-action" channel the menu items use.
   mainWindow.webContents.on('before-input-event', (event, input) => {
-    if (input.type !== 'keyDown' || !input.meta) return;
+    if (input.type !== 'keyDown') return;
     let action = null;
-    if (input.shift) {
-      // brackets = horizontal (scopes); ; ' = vertical (sessions)
+    if (input.control && input.shift && input.code === 'Backquote') {
+      action = 'new-session'; // Ctrl+Shift+` — new session (VS Code style)
+    } else if (input.meta && input.shift) {
+      // brackets = horizontal (scopes); ' \ = vertical (sessions)
       if (input.code === 'BracketLeft') action = 'prev-scope';
       else if (input.code === 'BracketRight') action = 'next-scope';
       else if (input.code === 'Quote') action = 'prev-session';
       else if (input.code === 'Backslash') action = 'next-session';
-    } else {
+    } else if (input.meta) {
       const k = (input.key || '').toLowerCase();
       if (k === 'p') action = 'palette';
       else if (k === 't') action = 'new-session';

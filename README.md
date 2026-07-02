@@ -56,7 +56,7 @@ Electron renderer (UI)  ──IPC──►  main process  ──►  node-pty  �
 ## Keyboard
 
 - `⌘P` — open the repo palette (search repos under your parent folders, open as a tab)
-- `⌘T` — new session in the active scope
+- `⌘T` — new session in the active scope (or `Ctrl`+`Shift`+backtick, VS Code style)
 - `⌘1`–`⌘9` — jump to a session in the active scope
 - `⌘⇧[` / `⌘⇧]` — previous / next scope (the top bar)
 - `⌘⇧'` / `⌘⇧\` — previous / next session (the side bar)
