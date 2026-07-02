@@ -73,7 +73,15 @@ function createWindow() {
   mainWindow.webContents.on('before-input-event', (event, input) => {
     if (input.type !== 'keyDown') return;
     let action = null;
-    if (input.control && input.shift && input.code === 'Backquote') {
+    if (
+      input.shift &&
+      !input.meta &&
+      !input.control &&
+      !input.alt &&
+      (input.key === 'Enter' || input.code === 'Enter' || input.code === 'NumpadEnter')
+    ) {
+      action = 'newline'; // Shift+Enter — insert a newline instead of submitting
+    } else if (input.control && input.shift && input.code === 'Backquote') {
       action = 'new-session'; // Ctrl+Shift+` — new session (VS Code style)
     } else if (input.meta && input.shift) {
       // brackets = horizontal (scopes); ' \ = vertical (sessions)

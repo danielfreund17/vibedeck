@@ -494,23 +494,8 @@ async function ensureTerminal(repo, session) {
   ptyToSession.set(ptyId, session.id);
   liveSlugs.add(session.slug);
 
-  // Shift+Enter inserts a newline (sent as Alt+Enter — ESC+CR — which Claude
-  // Code and most shells treat as a literal newline) instead of submitting.
-  // Also let ⌘ shortcuts bubble to the app (otherwise xterm cancels e.g. arrows).
-  term.attachCustomKeyEventHandler((e) => {
-    if (
-      e.type === 'keydown' &&
-      e.key === 'Enter' &&
-      e.shiftKey &&
-      !e.metaKey &&
-      !e.ctrlKey &&
-      !e.altKey
-    ) {
-      api.writeSession(ptyId, '\x1b\r');
-      return false;
-    }
-    return !e.metaKey;
-  });
+  // Let ⌘ shortcuts reach the app instead of being consumed by xterm.
+  term.attachCustomKeyEventHandler((e) => !e.metaKey);
 
   term.onData((data) => api.writeSession(ptyId, data));
   term.onResize(({ cols, rows }) => api.resizeSession(ptyId, cols, rows));
@@ -739,6 +724,9 @@ async function init() {
       }
     } else if (action === 'select-all') {
       activeEntry()?.term.selectAll();
+    } else if (action === 'newline') {
+      const entry = activeEntry();
+      if (entry) api.writeSession(entry.ptyId, '\x1b\r');
     } else if (action.startsWith('session:')) {
       const s = repo?.sessions[Number(action.slice(8)) - 1];
       if (s) selectSession(repo.id, s.id);
