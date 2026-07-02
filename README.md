@@ -60,6 +60,8 @@ Electron renderer (UI)  ──IPC──►  main process  ──►  node-pty  �
 - `⌘1`–`⌘9` — jump to a session in the active scope
 - `⌘⇧[` / `⌘⇧]` — previous / next scope (the top bar)
 - `⌘⇧'` / `⌘⇧\` — previous / next session (the side bar)
+- `⌘C` / `⌘V` — copy the selection / paste into the terminal · `⌘A` — select all
+- `⇧⏎` (Shift+Enter) — insert a newline instead of submitting (e.g. multi-line prompts in Claude Code)
 - Double-click a scope or session name to rename it
 
 ## Roadmap
