@@ -397,7 +397,7 @@ async function removeSession(repoId, sessionId) {
   await destroySession(session, true);
   repo.sessions = repo.sessions.filter((s) => s.id !== sessionId);
   if (activeSessionId(repoId) === sessionId) {
-    state.activeSessionByRepo[repoId] = repo.sessions[0]?.id || null;
+    state.activeSessionByRepo[repoId] = repo.sessions[repo.sessions.length - 1]?.id || null;
   }
   await persist();
   render();
@@ -778,6 +778,9 @@ async function init() {
     if (action === 'palette') openPalette();
     else if (action === 'new-session') {
       if (repo) addSession(repo.id);
+    } else if (action === 'close-session') {
+      const sid = repo ? activeSessionId(repo.id) : null;
+      if (repo && sid) removeSession(repo.id, sid);
     } else if (action === 'prev-scope') cycleRepo(-1);
     else if (action === 'next-scope') cycleRepo(1);
     else if (action === 'prev-session') cycleSession(-1);

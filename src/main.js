@@ -94,6 +94,7 @@ function createWindow() {
       const k = (input.key || '').toLowerCase();
       if (k === 'p') action = 'palette';
       else if (k === 't') action = 'new-session';
+      else if (k === 'w') action = 'close-session';
       else if (/^[1-9]$/.test(input.key)) action = `session:${input.key}`;
     }
     if (action) {
@@ -164,6 +165,7 @@ function buildMenu() {
       submenu: [
         item('Command Palette', 'Cmd+P', 'palette'),
         item('New Session', 'Cmd+T', 'new-session'),
+        item('Close Active Session', 'Cmd+W', 'close-session'),
         { type: 'separator' },
         item('Previous Scope', 'Cmd+Shift+[', 'prev-scope'),
         item('Next Scope', 'Cmd+Shift+]', 'next-scope'),
@@ -174,7 +176,15 @@ function buildMenu() {
       ],
     },
     { role: 'viewMenu' },
-    { role: 'windowMenu' },
+    {
+      label: 'Window',
+      submenu: [
+        { role: 'minimize' },
+        { role: 'zoom' },
+        { type: 'separator' },
+        { role: 'front' },
+      ],
+    },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
