@@ -3,17 +3,20 @@
 A lean terminal, organized in two dimensions.
 
 - **Scopes** (top bar) — one per project/folder. Switching scopes swaps which sessions you see.
-- **Sessions** (left bar) — persistent terminal tabs within the active scope. Run whatever you like in them: a shell, a coding agent, a dev server.
+- **Sessions** (left bar) — terminal tabs within the active scope. Run whatever you like in them: a shell, a coding agent, a dev server.
 
-Sessions are backed by `tmux`, so they **survive quitting and reopening the app** — reopen and your long-running processes are still there. VibeDeck is just a clean UI on top; it doesn't restrict what any session can do.
+Each session is your login shell running on its own pty, wired straight to the terminal — the same way a native terminal (Warp/iTerm/VS Code) works — so rendering is clean and fast, and modern TUIs (Claude Code, pi, …) behave exactly as they would anywhere else.
 
 > A session's scope is an organizational label (its default working directory). It does **not** sandbox the session — any session can still touch any file on your machine.
+
+## Persistence
+
+VibeDeck remembers your **layout** — scopes, session names, and working directories — and restores it on the next launch, reopening a fresh shell in each session's directory. The shells themselves do **not** survive quitting the app: a process running in a session dies on ⌘Q. If you need something to keep running across a restart, start `tmux` (or `screen`) inside a session yourself.
 
 ## Requirements
 
 - macOS (developed/tested there; Linux likely works with minor tweaks)
 - [Node.js](https://nodejs.org) 18+
-- [`tmux`](https://github.com/tmux/tmux) on your `PATH` — `brew install tmux`
 
 ## Install & run
 
@@ -40,18 +43,18 @@ npm run dist                  # -> dist/VibeDeck-<version>-arm64.dmg  (unsigned)
 bash scripts/install-app.sh   # copy the built app into /Applications + launch
 ```
 
-Prefer to install by hand? Open the `.dmg` and drag **VibeDeck** to Applications. The build is **unsigned**; a *downloaded* copy may be blocked on first launch — right-click the app → **Open** once, or run `xattr -dr com.apple.quarantine /Applications/VibeDeck.app`. (A locally built copy isn't quarantined.) Requires `tmux` installed.
+Prefer to install by hand? Open the `.dmg` and drag **VibeDeck** to Applications. The build is **unsigned**; a *downloaded* copy may be blocked on first launch — right-click the app → **Open** once, or run `xattr -dr com.apple.quarantine /Applications/VibeDeck.app`. (A locally built copy isn't quarantined.)
 
 ## How it works
 
 ```
-Electron renderer (UI)  ──IPC──►  main process  ──►  node-pty  ──►  tmux -L vibedeck new-session -A -t <slug>
-   scopes × sessions                pty manager                         tmux server (persists) ──► your shell
+Electron renderer (UI)  ──IPC──►  main process  ──►  node-pty  ──►  your login shell
+   scopes × sessions                pty manager                       (zsh -l, in the scope's dir)
 ```
 
-- Each session is a `tmux` session on a **dedicated socket** (`-L vibedeck`), isolated from any tmux you run by hand.
-- The app owns the scope→session model in `state.json` (in Electron's userData dir). tmux only knows opaque slugs.
-- Closing the app kills the tmux *clients*, not the server — so sessions keep running and reattach on the next launch.
+- Each session is a login shell on a dedicated pty; the terminal (xterm.js) talks straight to it — no multiplexer in between.
+- The app owns the scope→session model in `state.json` (in Electron's userData dir). That layout persists; the shells don't.
+- VibeDeck speaks the [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) so modified keys (like Shift+Enter) reach apps unambiguously, and ⌘V pastes a clipboard **image** as a temp-file path so agents can attach it.
 
 ## Keyboard
 
@@ -60,14 +63,15 @@ Electron renderer (UI)  ──IPC──►  main process  ──►  node-pty  �
 - `⌘1`–`⌘9` — jump to a session in the active scope
 - `⌘⇧[` / `⌘⇧]` — previous / next scope (the top bar)
 - `⌘⇧'` / `⌘⇧\` — previous / next session (the side bar)
-- `⌘C` / `⌘V` — copy the selection / paste into the terminal · `⌘A` — select all
-- `⇧⏎` (Shift+Enter) — insert a newline instead of submitting (e.g. multi-line prompts in Claude Code)
+- `⌘C` / `⌘V` — copy the selection / paste · `⌘A` — select all
+- `⇧⏎` (Shift+Enter) — insert a newline instead of submitting (works in Claude Code, pi, and any app that speaks the keyboard protocol)
+- **Paste an image** — copy an image (screenshot, browser "Copy Image", …) and `⌘V`: VibeDeck saves it to a temp PNG and types the path, so Claude Code / pi attach it (like a drag-and-drop)
 - Double-click a scope or session name to rename it
 
 ## Roadmap
 
+- Opt-in persistent sessions (reattach a background shell across restarts)
 - Split panes within a session
-- Live running/idle indicator from `tmux` activity
 - Drag to reorder scopes and sessions
 - Configurable theme and font
 

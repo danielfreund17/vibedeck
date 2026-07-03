@@ -8,16 +8,16 @@ contextBridge.exposeInMainWorld('api', {
   loadState: () => ipcRenderer.invoke('state:load'),
   saveState: (s) => ipcRenderer.invoke('state:save', s),
   pickFolder: () => ipcRenderer.invoke('dialog:pickFolder'),
-  listSessions: () => ipcRenderer.invoke('tmux:listSessions'),
+  listSessions: () => ipcRenderer.invoke('sessions:live'),
   scanRepos: (parents) => ipcRenderer.invoke('repos:scan', parents),
   clipWrite: (text) => ipcRenderer.invoke('clipboard:write', text),
   clipRead: () => ipcRenderer.invoke('clipboard:read'),
+  clipReadImage: () => ipcRenderer.invoke('clipboard:readImage'),
 
   startSession: (opts) => ipcRenderer.invoke('session:start', opts),
   killSession: (slug, ptyId) => ipcRenderer.invoke('session:kill', { slug, ptyId }),
   writeSession: (ptyId, data) => ipcRenderer.send('session:write', { ptyId, data }),
   resizeSession: (ptyId, cols, rows) => ipcRenderer.send('session:resize', { ptyId, cols, rows }),
-  redraw: (slug) => ipcRenderer.send('session:redraw', slug),
 
   onData: (cb) => ipcRenderer.on('session:data', (_e, payload) => cb(payload)),
   onExit: (cb) => ipcRenderer.on('session:exit', (_e, payload) => cb(payload)),

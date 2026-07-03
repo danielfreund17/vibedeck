@@ -3,7 +3,7 @@
 /* globals Terminal, FitAddon */
 
 // VibeDeck renderer. Owns the scope -> session model, renders the two-axis UI,
-// and lazily attaches an xterm <-> pty <-> tmux pipe per session on demand.
+// and lazily attaches an xterm <-> pty <-> shell pipe per session on demand.
 
 const api = window.api;
 
@@ -14,8 +14,8 @@ let state = {
   sidebarWidth: 210,
   parentFolders: [],
 };
-let liveSlugs = new Set(); // tmux sessions alive on our socket right now
-let hostname = ''; // used to ignore tmux's default (hostname) pane title
+let liveSlugs = new Set(); // sessions with a shell open right now (none, at launch)
+let hostname = ''; // used to ignore a bare-hostname terminal title
 let homedir = ''; // used to prettify paths (~/...)
 let paletteEl = null; // the open command-palette overlay, if any
 
@@ -55,12 +55,12 @@ function persistSoon() {
 
 // Auto-naming: a session's display name follows the terminal title the running
 // program sets (e.g. Claude Code), unless the user pinned a name. Filters out
-// tmux's default (hostname) title and bare/idle shell titles so they don't
-// clobber a meaningful name.
+// a bare hostname title and bare/idle shell titles so they don't clobber a
+// meaningful name.
 function cleanAutoTitle(raw) {
   const t = (raw || '').trim();
   if (!t) return null;
-  if (hostname && t === hostname) return null; // tmux's default pane title
+  if (hostname && t === hostname) return null; // bare hostname, not a real title
   if (/^-?(zsh|bash|sh|fish|dash|tcsh|ksh)$/i.test(t)) return null; // idle shell
   if (/^[^\s@]+@[^\s:]+:/.test(t)) return null; // user@host:path idle title
   return t.length > 120 ? t.slice(0, 119) + '…' : t;
@@ -403,8 +403,8 @@ async function removeSession(repoId, sessionId) {
   render();
 }
 
-// Tear down the local xterm; optionally destroy the backing tmux session.
-async function destroySession(session, killTmux) {
+// Tear down the local xterm; optionally kill the session's shell too.
+async function destroySession(session, killShell) {
   const entry = terminals.get(session.id);
   if (entry) {
     try {
@@ -416,7 +416,7 @@ async function destroySession(session, killTmux) {
     ptyToSession.delete(entry.ptyId);
     terminals.delete(session.id);
   }
-  if (killTmux) {
+  if (killShell) {
     await api.killSession(session.slug, entry?.ptyId || null);
     liveSlugs.delete(session.slug);
   }
@@ -489,7 +489,17 @@ async function ensureTerminal(repo, session) {
     rows: term.rows,
   });
 
-  const entry = { term, fit, ptyId, el: wrap, slug: session.slug, lastCols: term.cols, lastRows: term.rows };
+  const entry = {
+    term,
+    fit,
+    ptyId,
+    el: wrap,
+    slug: session.slug,
+    lastCols: term.cols,
+    lastRows: term.rows,
+    kittyStack: [], // kitty keyboard-protocol flags the running app has pushed
+    kbTail: '', // carry an incomplete trailing escape across data chunks
+  };
   terminals.set(session.id, entry);
   ptyToSession.set(ptyId, session.id);
   liveSlugs.add(session.slug);
@@ -621,33 +631,9 @@ async function mountActive() {
 }
 
 // ---------- global events ----------
-// Fit a terminal to its container, but only tell the pty when the size actually
-// changed. Spurious resizes make inline TUIs (pi, Claude Code) redraw and can
-// leave duplicated/scattered output.
-// Some inline TUIs (pi) only re-render on SIGWINCH, and xterm's steady-state DOM
-// render can lag its buffer once resizing stops — leaving blank/leftover rows.
-// After the last resize settles, force a couple of full redraws (scrolling to
-// the latest output) so the display matches the buffer, like it does mid-drag.
-let refreshTimer = null;
-function forceRedraw() {
-  const entry = activeEntry();
-  if (!entry) return;
-  api.redraw(entry.slug); // tmux resends a full clean screen -> xterm resyncs
-  try {
-    entry.term.scrollToBottom();
-  } catch {
-    /* noop */
-  }
-}
-function scheduleRedraw() {
-  if (refreshTimer) clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(() => {
-    refreshTimer = null;
-    forceRedraw();
-    setTimeout(forceRedraw, 250); // catch a late TUI redraw after SIGWINCH
-  }, 150);
-}
-
+// Fit a terminal to its container, telling the pty only when the size actually
+// changed. Each session is a shell pty talking straight to xterm, so a resize
+// just SIGWINCHes the program and it repaints itself — no relay, no redraw hacks.
 function fitEntry(entry) {
   if (!entry) return;
   try {
@@ -661,7 +647,6 @@ function fitEntry(entry) {
     entry.lastRows = rows;
     api.resizeSession(entry.ptyId, cols, rows);
   }
-  scheduleRedraw();
 }
 
 // Refit the visible terminal.
@@ -669,6 +654,42 @@ function fitActive() {
   const repo = activeRepo();
   const sid = repo ? activeSessionId(repo.id) : null;
   fitEntry(sid ? terminals.get(sid) : null);
+}
+
+// Kitty keyboard protocol (https://sw.kovidgoyal.net/kitty/keyboard-protocol/).
+// xterm.js doesn't implement it, so VibeDeck plays the terminal side: track the
+// flags an app pushes/pops and answer its support query. That lets modified keys
+// — notably Shift+Enter — be sent unambiguously as CSI-u, so a newline works in
+// any app that speaks the protocol (pi, etc.), the way Warp does natively.
+function currentKittyFlags(entry) {
+  const s = entry.kittyStack;
+  return s.length ? s[s.length - 1] : 0;
+}
+
+function trackKittyKeyboard(entry, data) {
+  const buf = (entry.kbTail || '') + data;
+  let m;
+  const push = /\x1b\[>([0-9]*)u/g; // CSI > flags u  — enable/push
+  while ((m = push.exec(buf))) entry.kittyStack.push(Number(m[1] || 0));
+  const pop = /\x1b\[<([0-9]*)u/g; // CSI < number u — pop (default 1)
+  while ((m = pop.exec(buf))) {
+    let n = Number(m[1] || 1);
+    while (n-- > 0) entry.kittyStack.pop();
+  }
+  const set = /\x1b\[=([0-9]*)(?:;[0-9]*)?u/g; // CSI = flags ; mode u — set current
+  while ((m = set.exec(buf))) {
+    const f = Number(m[1] || 0);
+    if (entry.kittyStack.length) entry.kittyStack[entry.kittyStack.length - 1] = f;
+    else entry.kittyStack.push(f);
+  }
+  // CSI ? u — the app is asking whether we support the protocol; reply with the
+  // current flags. Replying at all is what signals support (like a real terminal).
+  if (/\x1b\[\?u/.test(buf)) api.writeSession(entry.ptyId, `\x1b[?${currentKittyFlags(entry)}u`);
+
+  // Keep only an incomplete trailing escape, so a sequence split across chunks is
+  // still matched next time — and a complete one is never re-scanned (counted twice).
+  const i = buf.lastIndexOf('\x1b');
+  entry.kbTail = i !== -1 && !/[A-Za-z~]/.test(buf.slice(i + 1)) ? buf.slice(i, i + 16) : '';
 }
 
 window.addEventListener('resize', fitActive);
@@ -725,7 +746,10 @@ async function init() {
   // Route pty output to terminals (registered once, before any session starts).
   api.onData(({ ptyId, data }) => {
     const sessionId = ptyToSession.get(ptyId);
-    if (sessionId) terminals.get(sessionId)?.term.write(data);
+    const entry = sessionId && terminals.get(sessionId);
+    if (!entry) return;
+    trackKittyKeyboard(entry, data); // watch the app's keyboard-protocol negotiation
+    entry.term.write(data);
   });
   api.onExit(({ ptyId }) => {
     const sessionId = ptyToSession.get(ptyId);
@@ -750,14 +774,25 @@ async function init() {
     } else if (action === 'paste') {
       const entry = activeEntry();
       if (entry) {
-        const text = await api.clipRead();
-        if (text) entry.term.paste(text);
+        // Prefer a clipboard image: type its temp-file path (like a drag-and-drop)
+        // so Claude Code / pi attach it. Fall back to a normal text paste.
+        const imgPath = await api.clipReadImage();
+        if (imgPath) api.writeSession(entry.ptyId, imgPath + ' ');
+        else {
+          const text = await api.clipRead();
+          if (text) entry.term.paste(text);
+        }
       }
     } else if (action === 'select-all') {
       activeEntry()?.term.selectAll();
     } else if (action === 'newline') {
       const entry = activeEntry();
-      if (entry) api.writeSession(entry.ptyId, '\x1b\r');
+      if (entry) {
+        // Kitty-aware apps (pi) need a CSI-u Shift+Enter; others (Claude Code, a
+        // plain shell) take the legacy Alt+Enter. Both insert a newline.
+        const seq = currentKittyFlags(entry) ? '\x1b[13;2u' : '\x1b\r';
+        api.writeSession(entry.ptyId, seq);
+      }
     } else if (action.startsWith('session:')) {
       const s = repo?.sessions[Number(action.slice(8)) - 1];
       if (s) selectSession(repo.id, s.id);

@@ -1,7 +1,8 @@
 'use strict';
 
-// Persistent app state: the scope -> session model. tmux only ever sees opaque
-// slugs; the human-facing organization lives here, in Electron's userData dir.
+// Persistent app state: the scope -> session model. This is what survives a
+// restart — the human-facing organization (scopes, session names, working
+// dirs), stored in Electron's userData dir. The shells themselves don't persist.
 
 const fs = require('fs');
 const path = require('path');

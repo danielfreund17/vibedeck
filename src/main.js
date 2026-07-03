@@ -6,15 +6,16 @@ const crypto = require('crypto');
 const os = require('os');
 const fs = require('fs');
 const state = require('./state');
-const tmux = require('./tmux');
+const shell = require('./shell');
 
 // Keep dev (`npm start`) and the packaged .app pointed at the same state/config.
 app.setPath('userData', path.join(app.getPath('appData'), 'vibedeck'));
 
 let mainWindow = null;
 
-// ptyId -> { proc, slug }. ptyId is per-attach (a live client); slug is the
-// durable tmux session identity that survives app restarts.
+// ptyId -> { proc, slug }. ptyId identifies a live shell for this app run; slug
+// is the app's durable session id (its layout persists in state; the shell
+// doesn't survive a restart).
 const ptys = new Map();
 
 function userDataDir() {
@@ -108,10 +109,9 @@ function sendMenu(action) {
   }
 }
 
-// After a new session's shell settles at its first prompt (output goes quiet),
-// cd it into the repo. `builtin cd` bypasses shell `cd` wrappers (e.g. RVM's),
-// and waiting for quiet avoids racing shell startup. Only used for new sessions
-// so a reattached (possibly agent-running) pane is never disturbed.
+// After a session's shell settles at its first prompt (output goes quiet), cd it
+// into the repo. `builtin cd` bypasses shell `cd` wrappers (e.g. RVM's), and
+// waiting for quiet avoids racing shell startup.
 function scheduleInitialCd(proc, dir) {
   const quoted = `'${String(dir).replace(/'/g, `'\\''`)}'`;
   let timer = null;
@@ -179,8 +179,7 @@ function buildMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
-app.whenReady().then(async () => {
-  await tmux.initServer(userDataDir());
+app.whenReady().then(() => {
   createWindow();
   buildMenu();
   app.on('activate', () => {
@@ -192,7 +191,7 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-// Kill the tmux *clients* on quit; the tmux server (and your shells) live on.
+// Kill every session's shell on quit — nothing persists past the app.
 app.on('before-quit', () => {
   for (const { proc } of ptys.values()) {
     try {
@@ -213,6 +212,34 @@ ipcMain.handle('clipboard:write', (_e, text) => {
 });
 ipcMain.handle('clipboard:read', () => clipboard.readText());
 
+// If the clipboard holds an image, stash it as a temp PNG and return the path so
+// the renderer can type it into the terminal — Claude Code / pi read an image
+// path from the prompt, the same way a drag-and-drop works. Returns null when
+// there's no image (the renderer then falls back to a normal text paste).
+ipcMain.handle('clipboard:readImage', () => {
+  const img = clipboard.readImage();
+  if (img.isEmpty()) return null;
+  try {
+    const dir = path.join(os.tmpdir(), 'vibedeck-paste');
+    fs.mkdirSync(dir, { recursive: true });
+    // Best-effort prune of pastes older than a day so the dir doesn't grow.
+    try {
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      for (const name of fs.readdirSync(dir)) {
+        const p = path.join(dir, name);
+        if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p);
+      }
+    } catch {
+      /* pruning is best-effort */
+    }
+    const file = path.join(dir, `img-${crypto.randomUUID()}.png`);
+    fs.writeFileSync(file, img.toPNG());
+    return file;
+  } catch {
+    return null; // fall back to text paste
+  }
+});
+
 // ---- state ----
 ipcMain.handle('state:load', () => state.loadState(userDataDir()));
 ipcMain.handle('state:save', (_e, s) => {
@@ -231,15 +258,15 @@ ipcMain.handle('dialog:pickFolder', async () => {
   return { path: p, name: path.basename(p) };
 });
 
-// ---- tmux discovery (reconciliation on launch) ----
-ipcMain.handle('tmux:listSessions', () => tmux.listSessions());
+// ---- live-session reconciliation on launch (always empty: nothing persists) ----
+ipcMain.handle('sessions:live', () => shell.listSessions());
 
 // ---- repo discovery under registered parent folders ----
 ipcMain.handle('repos:scan', (_e, parentFolders) => scanRepos(parentFolders));
 
 // ---- sessions ----
 ipcMain.handle('session:start', (_e, { slug, cwd, cols, rows }) => {
-  const { proc, isNew, startDir } = tmux.spawnSession({ userDataDir: userDataDir(), slug, cwd, cols, rows });
+  const { proc, isNew, startDir } = shell.spawnSession({ slug, cwd, cols, rows });
   const ptyId = crypto.randomUUID();
   ptys.set(ptyId, { proc, slug });
 
@@ -255,8 +282,8 @@ ipcMain.handle('session:start', (_e, { slug, cwd, cols, rows }) => {
     }
   });
 
-  // Some shells cd on startup (RVM/oh-my-zsh here), overriding tmux -c. For a
-  // new session, once its shell settles at the first prompt, cd into the repo.
+  // Some shells cd on startup (RVM/oh-my-zsh here), overriding the pty's cwd.
+  // Once the shell settles at its first prompt, cd into the repo.
   if (isNew) scheduleInitialCd(proc, startDir);
 
   return { ptyId };
@@ -284,11 +311,8 @@ ipcMain.on('session:resize', (_e, { ptyId, cols, rows }) => {
   }
 });
 
-// Force a full tmux repaint of the session's client (resyncs a drifted xterm).
-ipcMain.on('session:redraw', (_e, slug) => tmux.refreshClient(slug));
-
-// Permanently destroy a session: kill this client, then the tmux session.
-ipcMain.handle('session:kill', async (_e, { slug, ptyId }) => {
+// Destroy a session: kill its shell.
+ipcMain.handle('session:kill', (_e, { ptyId }) => {
   if (ptyId && ptys.has(ptyId)) {
     try {
       ptys.get(ptyId).proc.kill();
@@ -297,6 +321,5 @@ ipcMain.handle('session:kill', async (_e, { slug, ptyId }) => {
     }
     ptys.delete(ptyId);
   }
-  if (slug) await tmux.killSession(slug);
   return true;
 });
