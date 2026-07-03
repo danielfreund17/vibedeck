@@ -749,7 +749,21 @@ async function init() {
     const entry = sessionId && terminals.get(sessionId);
     if (!entry) return;
     trackKittyKeyboard(entry, data); // watch the app's keyboard-protocol negotiation
-    entry.term.write(data);
+    // Follow the tail: if the user is already at the bottom, keep them there after
+    // this output — so a full redraw (e.g. an app's /reload) lands on the latest
+    // state instead of jumping to the top of the scrollback. If they've scrolled
+    // up to read history, leave the viewport alone.
+    const buf = entry.term.buffer.active;
+    const wasBottom = buf.viewportY >= buf.baseY;
+    entry.term.write(data, () => {
+      if (wasBottom) {
+        try {
+          entry.term.scrollToBottom();
+        } catch {
+          /* noop */
+        }
+      }
+    });
   });
   api.onExit(({ ptyId }) => {
     const sessionId = ptyToSession.get(ptyId);

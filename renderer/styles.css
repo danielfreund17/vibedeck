@@ -215,6 +215,19 @@ body.resizing .terminals {
 }
 .term .xterm {
   height: 100%;
+  /* Reserve a sliver on the right that the fit addon subtracts from the column
+     count. Without it, at window widths that are near-exact multiples of the cell
+     width the last column lands flush on the viewport edge and its glyph is
+     clipped (e.g. pi's right-aligned status footer). Reserving ~1 cell drops that
+     flush column to a full-cell margin instead, so the last column is never cut. */
+  padding-right: 9px;
+}
+/* xterm forces `overflow-y: scroll`, so macOS draws an overlay scrollbar over the
+   rightmost columns. Hide it (wheel/trackpad scrolling still works) so nothing
+   overlaps the last column. */
+.term .xterm-viewport::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 .empty {
