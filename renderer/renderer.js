@@ -489,7 +489,7 @@ async function ensureTerminal(repo, session) {
     rows: term.rows,
   });
 
-  const entry = { term, fit, ptyId, el: wrap };
+  const entry = { term, fit, ptyId, el: wrap, lastCols: term.cols, lastRows: term.rows };
   terminals.set(session.id, entry);
   ptyToSession.set(ptyId, session.id);
   liveSlugs.add(session.slug);
@@ -615,29 +615,35 @@ async function mountActive() {
 
   entry.el.style.display = 'block';
   requestAnimationFrame(() => {
-    try {
-      entry.fit.fit();
-    } catch {
-      /* noop */
-    }
+    fitEntry(entry);
     entry.term.focus();
-    api.resizeSession(entry.ptyId, entry.term.cols, entry.term.rows);
   });
 }
 
 // ---------- global events ----------
-// Refit the visible terminal to its container and tell the pty the new size.
-function fitActive() {
-  const repo = activeRepo();
-  const sid = repo ? activeSessionId(repo.id) : null;
-  const entry = sid ? terminals.get(sid) : null;
+// Fit a terminal to its container, but only tell the pty when the size actually
+// changed. Spurious resizes make inline TUIs (pi, Claude Code) redraw and can
+// leave duplicated/scattered output.
+function fitEntry(entry) {
   if (!entry) return;
   try {
     entry.fit.fit();
   } catch {
-    /* noop */
+    /* not measurable */
   }
-  api.resizeSession(entry.ptyId, entry.term.cols, entry.term.rows);
+  const { cols, rows } = entry.term;
+  if (cols > 0 && rows > 0 && (cols !== entry.lastCols || rows !== entry.lastRows)) {
+    entry.lastCols = cols;
+    entry.lastRows = rows;
+    api.resizeSession(entry.ptyId, cols, rows);
+  }
+}
+
+// Refit the visible terminal.
+function fitActive() {
+  const repo = activeRepo();
+  const sid = repo ? activeSessionId(repo.id) : null;
+  fitEntry(sid ? terminals.get(sid) : null);
 }
 
 window.addEventListener('resize', fitActive);
