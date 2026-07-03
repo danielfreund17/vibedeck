@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('api', {
   killSession: (slug, ptyId) => ipcRenderer.invoke('session:kill', { slug, ptyId }),
   writeSession: (ptyId, data) => ipcRenderer.send('session:write', { ptyId, data }),
   resizeSession: (ptyId, cols, rows) => ipcRenderer.send('session:resize', { ptyId, cols, rows }),
+  redraw: (slug) => ipcRenderer.send('session:redraw', slug),
 
   onData: (cb) => ipcRenderer.on('session:data', (_e, payload) => cb(payload)),
   onExit: (cb) => ipcRenderer.on('session:exit', (_e, payload) => cb(payload)),

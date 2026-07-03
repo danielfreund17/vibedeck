@@ -170,4 +170,22 @@ function initServer(userDataDir) {
   });
 }
 
-module.exports = { spawnSession, listSessions, killSession, isValidSlug, initServer };
+// Force tmux to fully repaint the session's client(s). Resyncs an xterm whose
+// incremental render drifted (e.g. after a resize with an inline TUI). Unlike a
+// resize this does NOT SIGWINCH the app, so it won't trigger another redraw.
+function refreshClient(slug) {
+  if (!isValidSlug(slug)) return;
+  const bin = resolveTmux();
+  execFile(
+    bin,
+    ['-L', SOCKET, 'list-clients', '-t', slug, '-F', '#{client_tty}'],
+    (err, out) => {
+      if (err || !out) return;
+      for (const tty of out.split('\n').map((s) => s.trim()).filter(Boolean)) {
+        execFile(bin, ['-L', SOCKET, 'refresh-client', '-t', tty], () => {});
+      }
+    }
+  );
+}
+
+module.exports = { spawnSession, listSessions, killSession, isValidSlug, initServer, refreshClient };

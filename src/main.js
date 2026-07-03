@@ -284,6 +284,9 @@ ipcMain.on('session:resize', (_e, { ptyId, cols, rows }) => {
   }
 });
 
+// Force a full tmux repaint of the session's client (resyncs a drifted xterm).
+ipcMain.on('session:redraw', (_e, slug) => tmux.refreshClient(slug));
+
 // Permanently destroy a session: kill this client, then the tmux session.
 ipcMain.handle('session:kill', async (_e, { slug, ptyId }) => {
   if (ptyId && ptys.has(ptyId)) {

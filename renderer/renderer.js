@@ -489,7 +489,7 @@ async function ensureTerminal(repo, session) {
     rows: term.rows,
   });
 
-  const entry = { term, fit, ptyId, el: wrap, lastCols: term.cols, lastRows: term.rows };
+  const entry = { term, fit, ptyId, el: wrap, slug: session.slug, lastCols: term.cols, lastRows: term.rows };
   terminals.set(session.id, entry);
   ptyToSession.set(ptyId, session.id);
   liveSlugs.add(session.slug);
@@ -632,9 +632,9 @@ let refreshTimer = null;
 function forceRedraw() {
   const entry = activeEntry();
   if (!entry) return;
+  api.redraw(entry.slug); // tmux resends a full clean screen -> xterm resyncs
   try {
     entry.term.scrollToBottom();
-    entry.term.refresh(0, entry.term.rows - 1);
   } catch {
     /* noop */
   }
