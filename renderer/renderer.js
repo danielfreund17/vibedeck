@@ -624,6 +624,30 @@ async function mountActive() {
 // Fit a terminal to its container, but only tell the pty when the size actually
 // changed. Spurious resizes make inline TUIs (pi, Claude Code) redraw and can
 // leave duplicated/scattered output.
+// Some inline TUIs (pi) only re-render on SIGWINCH, and xterm's steady-state DOM
+// render can lag its buffer once resizing stops — leaving blank/leftover rows.
+// After the last resize settles, force a couple of full redraws (scrolling to
+// the latest output) so the display matches the buffer, like it does mid-drag.
+let refreshTimer = null;
+function forceRedraw() {
+  const entry = activeEntry();
+  if (!entry) return;
+  try {
+    entry.term.scrollToBottom();
+    entry.term.refresh(0, entry.term.rows - 1);
+  } catch {
+    /* noop */
+  }
+}
+function scheduleRedraw() {
+  if (refreshTimer) clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null;
+    forceRedraw();
+    setTimeout(forceRedraw, 250); // catch a late TUI redraw after SIGWINCH
+  }, 150);
+}
+
 function fitEntry(entry) {
   if (!entry) return;
   try {
@@ -637,6 +661,7 @@ function fitEntry(entry) {
     entry.lastRows = rows;
     api.resizeSession(entry.ptyId, cols, rows);
   }
+  scheduleRedraw();
 }
 
 // Refit the visible terminal.
