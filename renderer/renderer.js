@@ -1,6 +1,6 @@
 'use strict';
 
-/* globals Terminal, FitAddon */
+/* globals Terminal, FitAddon, WebLinksAddon */
 
 // VibeDeck renderer. Owns the scope -> session model, renders the two-axis UI,
 // and lazily attaches an xterm <-> pty <-> shell pipe per session on demand.
@@ -15,6 +15,8 @@ let state = {
   parentFolders: [],
 };
 let liveSlugs = new Set(); // sessions with a shell open right now (none, at launch)
+const busySessionIds = new Set(); // sessions that emitted output recently
+const busyTimers = new Map(); // sessionId -> timer that settles the activity dot
 let hostname = ''; // used to ignore a bare-hostname terminal title
 let homedir = ''; // used to prettify paths (~/...)
 let paletteEl = null; // the open command-palette overlay, if any
@@ -446,6 +448,48 @@ function cycleSession(dir) {
   selectSession(repo.id, repo.sessions[nextIdx].id);
 }
 
+function updateSessionActivityDot(sessionId) {
+  const dot = document.querySelector(`.dot[data-sid="${sessionId}"]`);
+  if (dot) dot.classList.toggle('busy', busySessionIds.has(sessionId));
+}
+
+function markSessionBusy(sessionId) {
+  if (!sessionId) return;
+  busySessionIds.add(sessionId);
+  updateSessionActivityDot(sessionId);
+
+  const existing = busyTimers.get(sessionId);
+  if (existing) clearTimeout(existing);
+  busyTimers.set(
+    sessionId,
+    setTimeout(() => {
+      busyTimers.delete(sessionId);
+      busySessionIds.delete(sessionId);
+      updateSessionActivityDot(sessionId);
+    }, 1800)
+  );
+}
+
+function moveSession(repoId, draggedSessionId, targetSessionId, placeAfterTarget) {
+  if (!draggedSessionId || !targetSessionId || draggedSessionId === targetSessionId) return;
+  const repo = state.repos.find((r) => r.id === repoId);
+  if (!repo) return;
+
+  const fromIndex = repo.sessions.findIndex((s) => s.id === draggedSessionId);
+  if (fromIndex === -1) return;
+
+  const [moved] = repo.sessions.splice(fromIndex, 1);
+  const targetIndex = repo.sessions.findIndex((s) => s.id === targetSessionId);
+  if (targetIndex === -1) {
+    repo.sessions.splice(fromIndex, 0, moved);
+    return;
+  }
+
+  repo.sessions.splice(placeAfterTarget ? targetIndex + 1 : targetIndex, 0, moved);
+  persist();
+  render();
+}
+
 // Move left (-1) / right (+1) across the scope tabs, wrapping around.
 function cycleRepo(dir) {
   if (state.repos.length === 0) return;
@@ -454,6 +498,23 @@ function cycleRepo(dir) {
   const n = state.repos.length;
   const nextIdx = (idx + dir + n) % n;
   selectRepo(state.repos[nextIdx].id);
+}
+
+function isMacLikePlatform() {
+  return /Mac|iPhone|iPad|iPod/.test(navigator.platform || '');
+}
+
+function shouldOpenTerminalLink(event) {
+  return isMacLikePlatform() ? event.metaKey : event.ctrlKey;
+}
+
+function openTerminalLink(event, uri) {
+  if (!shouldOpenTerminalLink(event)) return;
+  event.preventDefault();
+  event.stopPropagation();
+  void api.openExternalUrl(uri).catch(() => {
+    // Best effort: invalid/unopenable links are rejected by the main process.
+  });
 }
 
 // ---------- terminal lifecycle ----------
@@ -475,6 +536,7 @@ async function ensureTerminal(repo, session) {
   });
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
+  term.loadAddon(new WebLinksAddon.WebLinksAddon(openTerminalLink));
   term.open(wrap);
   try {
     fit.fit();
@@ -570,12 +632,49 @@ function renderSidebar() {
   list.className = 'session-list';
   const activeSid = activeSessionId(repo.id);
 
+  let draggedSessionId = null;
+
+  function clearDropTargets() {
+    list.querySelectorAll('.session.drop-before, .session.drop-after').forEach((node) => {
+      node.classList.remove('drop-before', 'drop-after');
+    });
+  }
+
   for (const s of repo.sessions) {
     const item = document.createElement('div');
     item.className = 'session' + (s.id === activeSid ? ' active' : '');
+    item.dataset.sid = s.id;
+    item.draggable = true;
+
+    item.addEventListener('dragstart', (e) => {
+      draggedSessionId = s.id;
+      item.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', s.id);
+    });
+    item.addEventListener('dragend', () => {
+      draggedSessionId = null;
+      item.classList.remove('dragging');
+      clearDropTargets();
+    });
+    item.addEventListener('dragover', (e) => {
+      if (!draggedSessionId || draggedSessionId === s.id) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      const placeAfter = e.clientY > item.getBoundingClientRect().top + item.offsetHeight / 2;
+      clearDropTargets();
+      item.classList.add(placeAfter ? 'drop-after' : 'drop-before');
+    });
+    item.addEventListener('drop', (e) => {
+      if (!draggedSessionId || draggedSessionId === s.id) return;
+      e.preventDefault();
+      const placeAfter = e.clientY > item.getBoundingClientRect().top + item.offsetHeight / 2;
+      moveSession(repo.id, draggedSessionId, s.id, placeAfter);
+    });
 
     const dot = document.createElement('span');
-    dot.className = 'dot' + (liveSlugs.has(s.slug) ? ' live' : '');
+    dot.className = 'dot' + (liveSlugs.has(s.slug) ? ' live' : '') + (busySessionIds.has(s.id) ? ' busy' : '');
+    dot.dataset.sid = s.id;
 
     const name = document.createElement('span');
     name.className = 'session-name';
@@ -748,6 +847,7 @@ async function init() {
     const sessionId = ptyToSession.get(ptyId);
     const entry = sessionId && terminals.get(sessionId);
     if (!entry) return;
+    markSessionBusy(sessionId);
     trackKittyKeyboard(entry, data); // watch the app's keyboard-protocol negotiation
     // Follow the tail: if the user is already at the bottom, keep them there after
     // this output — so a full redraw (e.g. an app's /reload) lands on the latest

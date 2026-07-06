@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, Menu, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Menu, clipboard, shell: electronShell } = require('electron');
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
@@ -221,6 +221,20 @@ ipcMain.handle('clipboard:write', (_e, text) => {
   return true;
 });
 ipcMain.handle('clipboard:read', () => clipboard.readText());
+
+// Open terminal links in the user's default browser. Only allow web URLs; terminal
+// output is untrusted and must not be able to launch arbitrary app protocols.
+ipcMain.handle('shell:openExternalUrl', async (_e, rawUrl) => {
+  let url;
+  try {
+    url = new URL(String(rawUrl ?? ''));
+  } catch {
+    return false;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+  await electronShell.openExternal(url.toString());
+  return true;
+});
 
 // If the clipboard holds an image, stash it as a temp PNG and return the path so
 // the renderer can type it into the terminal — Claude Code / pi read an image

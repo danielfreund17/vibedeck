@@ -15,6 +15,7 @@ const files = [
   ['@xterm/xterm/lib/xterm.js', 'xterm.js'],
   ['@xterm/xterm/css/xterm.css', 'xterm.css'],
   ['@xterm/addon-fit/lib/addon-fit.js', 'addon-fit.js'],
+  ['@xterm/addon-web-links/lib/addon-web-links.js', 'addon-web-links.js'],
 ];
 
 for (const [src, out] of files) {

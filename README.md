@@ -66,13 +66,15 @@ Electron renderer (UI)  ──IPC──►  main process  ──►  node-pty  �
 - `⌘C` / `⌘V` — copy the selection / paste · `⌘A` — select all
 - `⇧⏎` (Shift+Enter) — insert a newline instead of submitting (works in Claude Code, pi, and any app that speaks the keyboard protocol)
 - **Paste an image** — copy an image (screenshot, browser "Copy Image", …) and `⌘V`: VibeDeck saves it to a temp PNG and types the path, so Claude Code / pi attach it (like a drag-and-drop)
+- `⌘`+click a terminal URL (`Ctrl`+click off macOS) — open the link in your default browser
+- Drag session tabs in the sidebar to reorder them
 - Double-click a scope or session name to rename it
 
 ## Roadmap
 
 - Opt-in persistent sessions (reattach a background shell across restarts)
 - Split panes within a session
-- Drag to reorder scopes and sessions
+- Drag to reorder scopes
 - Configurable theme and font
 
 ## License

@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('api', {
   clipWrite: (text) => ipcRenderer.invoke('clipboard:write', text),
   clipRead: () => ipcRenderer.invoke('clipboard:read'),
   clipReadImage: () => ipcRenderer.invoke('clipboard:readImage'),
+  openExternalUrl: (url) => ipcRenderer.invoke('shell:openExternalUrl', url),
 
   startSession: (opts) => ipcRenderer.invoke('session:start', opts),
   killSession: (slug, ptyId) => ipcRenderer.invoke('session:kill', { slug, ptyId }),
