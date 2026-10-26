@@ -12,6 +12,7 @@
 
 const os = require('os');
 const fs = require('fs');
+const path = require('path');
 const pty = require('node-pty');
 
 // Slugs are app-generated identifiers (tg_<hex>); validate defensively before
@@ -28,6 +29,10 @@ function dirExists(p) {
   }
 }
 
+function pathJoinHome(...parts) {
+  return path.join(os.homedir(), ...parts);
+}
+
 // Pick the shell to launch: honor $SHELL, else fall back to zsh (macOS default),
 // then bash/sh. A GUI app launched from Finder may not inherit $SHELL.
 function resolveShell() {
@@ -38,12 +43,14 @@ function resolveShell() {
   return '/bin/sh';
 }
 
-function shellEnv() {
+function shellEnv({ slug, updatesDir }) {
   const env = { ...process.env };
   // A GUI-launched app doesn't inherit the shell PATH; guarantee the common
   // bin dirs so tools (git, brew-installed binaries, agents) resolve.
-  const extra = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'];
+  const extra = [pathJoinHome('.local/bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'];
   env.PATH = [...new Set([...extra, ...(env.PATH ? env.PATH.split(':') : [])])].join(':');
+  env.VIBEDECK_SESSION_SLUG = slug;
+  if (updatesDir) env.VIBEDECK_UPDATES_DIR = updatesDir;
   // Let programs (e.g. Claude Code) own the terminal title so VibeDeck can
   // auto-name sessions; suppress oh-my-zsh's idle title churn for our shells.
   env.DISABLE_AUTO_TITLE = 'true';
@@ -64,7 +71,7 @@ function shellEnv() {
 // Spawn a login shell in `cwd`. Returns the pty, whether this created the
 // session (always true — nothing is reattached), and the resolved start dir so
 // the caller can settle the shell into the repo dir (see main.js).
-function spawnSession({ slug, cwd, cols, rows }) {
+function spawnSession({ slug, cwd, cols, rows, updatesDir }) {
   if (!isValidSlug(slug)) throw new Error(`invalid session slug: ${slug}`);
   const startDir = cwd && dirExists(cwd) ? cwd : os.homedir();
   const proc = pty.spawn(resolveShell(), ['-l'], {
@@ -72,7 +79,7 @@ function spawnSession({ slug, cwd, cols, rows }) {
     cols: cols || 80,
     rows: rows || 24,
     cwd: startDir,
-    env: shellEnv(),
+    env: shellEnv({ slug, updatesDir }),
   });
   return { proc, isNew: true, startDir };
 }

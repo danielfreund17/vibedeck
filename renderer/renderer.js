@@ -17,6 +17,9 @@ let state = {
 let liveSlugs = new Set(); // sessions with a shell open right now (none, at launch)
 const busySessionIds = new Set(); // sessions that emitted output recently
 const busyTimers = new Map(); // sessionId -> timer that settles the activity dot
+const sessionContexts = new Map(); // sessionId -> { cwd, git, pr }
+const contextTimers = new Map(); // sessionId -> debounced context refresh timer
+const contextRequests = new Map(); // sessionId -> monotonically increasing request id
 let hostname = ''; // used to ignore a bare-hostname terminal title
 let homedir = ''; // used to prettify paths (~/...)
 let paletteEl = null; // the open command-palette overlay, if any
@@ -32,6 +35,7 @@ const el = {
   terminals: document.getElementById('terminals'),
   empty: document.getElementById('empty'),
   resizer: document.getElementById('resizer'),
+  statusbar: document.getElementById('session-statusbar'),
 };
 
 // ---------- helpers ----------
@@ -55,28 +59,67 @@ function persistSoon() {
   }, 400);
 }
 
-// Auto-naming: a session's display name follows the terminal title the running
-// program sets (e.g. Claude Code), unless the user pinned a name. Filters out
-// a bare hostname title and bare/idle shell titles so they don't clobber a
-// meaningful name.
-function cleanAutoTitle(raw) {
-  const t = (raw || '').trim();
+// Auto-naming: manual names always win. Agent-like titles (for example from a
+// pi/Claude integration) outrank generic terminal titles.
+function decodeTitleMetadata(encoded) {
+  if (!encoded) return null;
+  try {
+    const normalized = encoded.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+    return JSON.parse(decodeURIComponent(escape(atob(padded))));
+  } catch {
+    return null;
+  }
+}
+
+function parseAutoTitle(raw) {
+  let t = (raw || '').trim();
   if (!t) return null;
+
+  let metadata = null;
+  const metaMatch = t.match(/\s*⟦vd:([A-Za-z0-9_-]+)⟧\s*$/);
+  if (metaMatch) {
+    metadata = decodeTitleMetadata(metaMatch[1]);
+    t = t.slice(0, metaMatch.index).trim();
+  }
+
   if (hostname && t === hostname) return null; // bare hostname, not a real title
   if (/^-?(zsh|bash|sh|fish|dash|tcsh|ksh)$/i.test(t)) return null; // idle shell
   if (/^[^\s@]+@[^\s:]+:/.test(t)) return null; // user@host:path idle title
-  return t.length > 120 ? t.slice(0, 119) + '…' : t;
+
+  const agentMatch = t.match(/^(pi|claude)(?:\s*[·•-]\s*|\s+)(.+)$/i);
+  const source = metadata || agentMatch ? 'agent' : 'terminal';
+  const name = (metadata?.title || (agentMatch ? agentMatch[2] : t)).trim();
+  if (!name) return null;
+  return { name: name.length > 120 ? name.slice(0, 119) + '…' : name, source, metadata };
+}
+
+function isManualName(session) {
+  return session.nameSource === 'manual' || session.pinned === true;
 }
 
 function applyAutoTitle(session, rawTitle) {
-  if (session.pinned) return;
-  const cleaned = cleanAutoTitle(rawTitle);
-  if (!cleaned || cleaned === session.name) return;
-  session.name = cleaned;
+  const parsed = parseAutoTitle(rawTitle);
+  if (!parsed) return;
+
+  const found = findSession(session.id);
+  if (parsed.metadata?.cwd && found && !session.worktreeLocked && session.cwdSource !== 'manual') {
+    session.cwd = parsed.metadata.cwd;
+    session.cwdSource = 'agent';
+    scheduleContextRefresh(found.repo, session, 0);
+    persistSoon();
+  }
+
+  if (isManualName(session)) return;
+  if (session.nameSource === 'agent' && parsed.source !== 'agent') return;
+  if (parsed.name === session.name && parsed.source === session.nameSource) return;
+
+  session.name = parsed.name;
+  session.nameSource = parsed.source;
   const label = document.querySelector(`.session-name[data-sid="${session.id}"]`);
   if (label) {
-    label.textContent = cleaned;
-    label.title = cleaned;
+    label.textContent = parsed.name;
+    label.title = sessionTitle(session);
   }
   persistSoon();
 }
@@ -90,6 +133,64 @@ function activeEntry() {
   const repo = activeRepo();
   const sid = repo ? activeSessionId(repo.id) : null;
   return sid ? terminals.get(sid) : null;
+}
+
+function normalizeStateShape() {
+  for (const repo of state.repos || []) {
+    if (!Array.isArray(repo.sessions)) repo.sessions = [];
+    for (const session of repo.sessions) {
+      if (!session.cwd) session.cwd = repo.cwd;
+      if (!session.cwdSource) session.cwdSource = session.cwd === repo.cwd ? 'default' : 'observed';
+      if (session.worktreeLocked !== true) session.worktreeLocked = session.cwdSource === 'manual';
+      if (!session.nameSource) session.nameSource = session.pinned ? 'manual' : 'default';
+      session.pinned = session.nameSource === 'manual'; // keep old state readers compatible
+    }
+  }
+}
+
+function sessionTitle(session) {
+  if (isManualName(session)) return `${session.name} (manual name)`;
+  if (session.nameSource === 'agent') return `${session.name} (agent-named — double-click to rename)`;
+  return `${session.name} (auto-named — double-click to rename)`;
+}
+
+function findSession(sessionId) {
+  for (const repo of state.repos || []) {
+    const session = repo.sessions.find((s) => s.id === sessionId);
+    if (session) return { repo, session };
+  }
+  return null;
+}
+
+function findSessionBySlug(slug) {
+  for (const repo of state.repos || []) {
+    const session = repo.sessions.find((s) => s.slug === slug);
+    if (session) return { repo, session };
+  }
+  return null;
+}
+
+function activeSessionRecord() {
+  const repo = activeRepo();
+  const sid = repo ? activeSessionId(repo.id) : null;
+  const session = sid ? repo.sessions.find((s) => s.id === sid) : null;
+  return repo && session ? { repo, session } : null;
+}
+
+function applyExternalContextUpdate(update) {
+  const found = update?.slug ? findSessionBySlug(update.slug) : activeSessionRecord();
+  if (!found || !update.cwd) return;
+  if (found.session.worktreeLocked && update.source !== 'vibedeck-ui') return;
+  found.session.cwd = update.cwd;
+  found.session.cwdSource = 'manual';
+  if (update.title && !isManualName(found.session)) {
+    found.session.name = update.title;
+    found.session.nameSource = 'manual';
+    found.session.pinned = true;
+  }
+  persistSoon();
+  scheduleContextRefresh(found.repo, found.session, 0);
+  render();
 }
 
 // A tiny text-input modal (Electron doesn't implement window.prompt).
@@ -146,7 +247,98 @@ async function openRepoScope(cwd, name) {
 }
 
 function prettyPath(p) {
-  return homedir && p.startsWith(homedir) ? '~' + p.slice(homedir.length) : p;
+  return homedir && p && p.startsWith(homedir) ? '~' + p.slice(homedir.length) : p;
+}
+
+function shortenMiddle(text, max = 36) {
+  const s = String(text || '');
+  if (s.length <= max) return s;
+  const keep = Math.max(4, Math.floor((max - 1) / 2));
+  return `${s.slice(0, keep)}…${s.slice(-keep)}`;
+}
+
+function prLabel(pr) {
+  if (!pr || pr.lookupState === 'none') return 'no PR';
+  if (pr.lookupState === 'error') return 'PR unavailable';
+  if (pr.lookupState !== 'found') return 'checking PR…';
+  const state = pr.isDraft ? 'draft' : String(pr.state || '').toLowerCase();
+  return `#${pr.number} ${state}`;
+}
+
+function prClass(pr) {
+  if (!pr || pr.lookupState !== 'found') return pr?.lookupState === 'error' ? 'pr-error' : 'pr-none';
+  if (pr.isDraft) return 'pr-draft';
+  return `pr-${String(pr.state || 'open').toLowerCase()}`;
+}
+
+function gitLabel(ctx) {
+  if (!ctx) return 'checking context…';
+  if (ctx.git?.unknownWorktree) return 'worktree unknown';
+  if (!ctx.git?.isRepo) return 'no git repo';
+  const branch = ctx.git.branch || (ctx.git.shortSha ? `detached ${ctx.git.shortSha}` : 'detached');
+  const dirty = ctx.git.dirty ? ' dirty' : '';
+  const ahead = ctx.git.ahead ? ` ↑${ctx.git.ahead}` : '';
+  const behind = ctx.git.behind ? ` ↓${ctx.git.behind}` : '';
+  return `${shortenMiddle(branch)}${dirty}${ahead}${behind}`;
+}
+
+function contextTooltip(session, ctx) {
+  const lines = [sessionTitle(session), `cwd: ${session.cwd || ''}`];
+  if (ctx?.git?.isRepo) {
+    lines.push(`worktree: ${ctx.git.worktreeRoot}`);
+    lines.push(`branch: ${ctx.git.branch || `detached ${ctx.git.shortSha || ''}`}`);
+    if (ctx.pr?.lookupState === 'found') lines.push(`PR #${ctx.pr.number}: ${ctx.pr.title}`);
+    else lines.push(`PR: ${prLabel(ctx.pr)}`);
+  } else if (ctx) {
+    lines.push('not a git repository');
+  }
+  return lines.filter(Boolean).join('\n');
+}
+
+function updateSessionContext(sessionId, ctx) {
+  sessionContexts.set(sessionId, ctx);
+  renderSidebar();
+  renderStatusbar();
+}
+
+function scheduleContextRefresh(repo, session, delay = 250) {
+  if (!repo || !session) return;
+  const key = session.id;
+  const existing = contextTimers.get(key);
+  if (existing) clearTimeout(existing);
+  contextTimers.set(
+    key,
+    setTimeout(async () => {
+      contextTimers.delete(key);
+      const requestId = (contextRequests.get(key) || 0) + 1;
+      contextRequests.set(key, requestId);
+      const cwd = session.cwd || repo.cwd;
+      try {
+        const ctx = await api.resolveSessionContext({
+          cwd,
+          repoCwd: repo.cwd,
+          cwdSource: session.cwdSource || 'default',
+          sessionName: session.name,
+        });
+        if (contextRequests.get(key) !== requestId) return;
+        if (ctx.cwdSource === 'inferred' && session.cwdSource === 'default' && ctx.cwd && ctx.cwd !== session.cwd) {
+          session.cwd = ctx.cwd;
+          session.cwdSource = 'inferred';
+          persistSoon();
+        }
+        updateSessionContext(key, ctx);
+      } catch {
+        if (contextRequests.get(key) !== requestId) return;
+        updateSessionContext(key, { cwd, git: { isRepo: false }, pr: { lookupState: 'error', message: 'Context lookup failed' } });
+      }
+    }, delay)
+  );
+}
+
+function refreshAllSessionContexts(delay = 100) {
+  for (const repo of state.repos || []) {
+    for (const session of repo.sessions || []) scheduleContextRefresh(repo, session, delay);
+  }
 }
 
 // Fuzzy score: prefix > substring > subsequence; -Infinity means no match.
@@ -192,13 +384,24 @@ async function openPalette() {
 
   function computeItems() {
     const q = input.value.trim().toLowerCase();
-    items = !q
-      ? paletteRepos.slice()
+    const repoItems = !q
+      ? paletteRepos.map((repo) => ({ type: 'repo', repo }))
       : paletteRepos
-          .map((r) => ({ r, s: fuzzyScore(r.name.toLowerCase(), q) }))
-          .filter((x) => x.s > -Infinity)
-          .sort((a, b) => b.s - a.s)
-          .map((x) => x.r);
+          .map((repo) => ({ type: 'repo', repo, score: fuzzyScore(repo.name.toLowerCase(), q) }))
+          .filter((item) => item.score > -Infinity)
+          .sort((a, b) => b.score - a.score);
+    const commandMatches = !q
+      ? []
+      : commandItems()
+          .filter((command) => command.enabled)
+          .map((command) => ({
+            type: 'command',
+            command,
+            score: Math.max(fuzzyScore(command.label.toLowerCase(), q), fuzzyScore(command.keywords, q) - 100),
+          }))
+          .filter((item) => item.score > -Infinity)
+          .sort((a, b) => b.score - a.score);
+    items = [...commandMatches, ...repoItems];
     if (sel >= items.length) sel = Math.max(0, items.length - 1);
   }
 
@@ -223,21 +426,26 @@ async function openPalette() {
       listEl.appendChild(d);
       return;
     }
-    items.forEach((r, i) => {
+    items.forEach((item, i) => {
       const row = document.createElement('div');
       row.className = 'palette-item' + (i === sel ? ' active' : '');
       const nm = document.createElement('span');
       nm.className = 'pi-name';
-      nm.textContent = r.name;
       const pa = document.createElement('span');
       pa.className = 'pi-path';
-      pa.textContent = openCwds.has(r.path) ? '• already open' : prettyPath(r.parent);
+      if (item.type === 'command') {
+        nm.textContent = item.command.label;
+        pa.textContent = item.command.detail;
+      } else {
+        nm.textContent = item.repo.name;
+        pa.textContent = openCwds.has(item.repo.path) ? '• already open' : prettyPath(item.repo.parent);
+      }
       row.append(nm, pa);
       row.onmouseenter = () => {
         sel = i;
         highlight();
       };
-      row.onclick = () => choose(r);
+      row.onclick = () => choose(item);
       listEl.appendChild(row);
     });
   }
@@ -268,9 +476,10 @@ async function openPalette() {
     renderSources();
   }
 
-  async function choose(r) {
+  async function choose(item) {
     close();
-    await openRepoScope(r.path, r.name);
+    if (item.type === 'command') await item.command.run();
+    else await openRepoScope(item.repo.path, item.repo.name);
   }
 
   function close() {
@@ -339,6 +548,300 @@ async function openPalette() {
   await rescan();
 }
 
+function contextTitle(ctx) {
+  if (ctx?.pr?.lookupState === 'found' && ctx.pr.title) return shortenMiddle(ctx.pr.title, 48);
+  if (ctx?.git?.branch) return shortenMiddle(ctx.git.branch, 48);
+  return 'worktree';
+}
+
+function commandItems() {
+  return [
+    {
+      label: 'Set Worktree for Active Session…',
+      detail: 'Choose a git worktree and assign it to the selected vertical tab',
+      keywords: 'worktree branch pr cwd set active session',
+      enabled: Boolean(activeSessionRecord()),
+      run: () => setWorktreeForActiveSession(),
+    },
+    {
+      label: 'Refresh Git/PR Status',
+      detail: 'Re-read git branch and GitHub PR status for the selected tab',
+      keywords: 'refresh git branch pr status',
+      enabled: Boolean(activeSessionRecord()),
+      run: () => refreshActiveSessionContext(),
+    },
+  ];
+}
+
+function openCommandPalette() {
+  if (paletteEl) return;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay palette-overlay';
+  overlay.innerHTML = `
+    <div class="palette">
+      <input class="palette-input" type="text" placeholder="Type a command…  (⏎ run · esc close)" spellcheck="false" />
+      <div class="palette-list"></div>
+    </div>`;
+  paletteEl = overlay;
+
+  const input = overlay.querySelector('.palette-input');
+  const listEl = overlay.querySelector('.palette-list');
+  let items = [];
+  let sel = 0;
+
+  function scoreCommand(command, q) {
+    return Math.max(fuzzyScore(command.label.toLowerCase(), q), fuzzyScore(command.keywords, q) - 100);
+  }
+
+  function computeItems() {
+    const q = input.value.trim().toLowerCase();
+    items = commandItems()
+      .filter((command) => command.enabled)
+      .map((command) => ({ command, score: q ? scoreCommand(command, q) : 0 }))
+      .filter((item) => !q || item.score > -Infinity)
+      .sort((a, b) => b.score - a.score)
+      .map((item) => item.command);
+    if (sel >= items.length) sel = Math.max(0, items.length - 1);
+  }
+
+  function highlight() {
+    [...listEl.children].forEach((child, i) => child.classList.toggle('active', i === sel));
+    listEl.children[sel]?.scrollIntoView({ block: 'nearest' });
+  }
+
+  function renderList() {
+    listEl.innerHTML = '';
+    if (!items.length) {
+      const empty = document.createElement('div');
+      empty.className = 'palette-empty';
+      empty.textContent = activeSessionRecord() ? 'No matching command.' : 'No active session.';
+      listEl.appendChild(empty);
+      return;
+    }
+    items.forEach((command, i) => {
+      const row = document.createElement('div');
+      row.className = 'palette-item' + (i === sel ? ' active' : '');
+      const label = document.createElement('span');
+      label.className = 'pi-name';
+      label.textContent = command.label;
+      const detail = document.createElement('span');
+      detail.className = 'pi-path';
+      detail.textContent = command.detail;
+      row.append(label, detail);
+      row.onmouseenter = () => {
+        sel = i;
+        highlight();
+      };
+      row.onclick = () => choose(command);
+      listEl.appendChild(row);
+    });
+  }
+
+  function close() {
+    overlay.remove();
+    paletteEl = null;
+    document.removeEventListener('keydown', onKey, true);
+  }
+
+  async function choose(command) {
+    close();
+    await command.run();
+  }
+
+  function onKey(e) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      close();
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (items.length) {
+        sel = (sel + 1) % items.length;
+        highlight();
+      }
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (items.length) {
+        sel = (sel - 1 + items.length) % items.length;
+        highlight();
+      }
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (items[sel]) choose(items[sel]);
+    }
+  }
+
+  input.addEventListener('input', () => {
+    computeItems();
+    renderList();
+  });
+  overlay.addEventListener('mousedown', (e) => {
+    if (e.target === overlay) close();
+  });
+  document.addEventListener('keydown', onKey, true);
+  document.body.appendChild(overlay);
+  computeItems();
+  renderList();
+  input.focus();
+}
+
+async function setWorktreeForActiveSession() {
+  const active = activeSessionRecord();
+  if (!active) return;
+
+  const worktrees = await api.listWorktrees(active.repo.cwd);
+  if (!worktrees.length) {
+    const picked = await api.pickFolder();
+    if (!picked) return;
+    active.session.cwd = picked.path;
+    active.session.cwdSource = 'manual';
+    active.session.worktreeLocked = true;
+    if (!isManualName(active.session)) {
+      active.session.name = picked.name;
+      active.session.nameSource = 'manual';
+      active.session.pinned = true;
+    }
+    await persist();
+    scheduleContextRefresh(active.repo, active.session, 0);
+    render();
+    return;
+  }
+
+  await openWorktreePicker(active, worktrees);
+}
+
+function openWorktreePicker(active, worktrees) {
+  return new Promise((resolve) => {
+    if (paletteEl) return resolve(null);
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay palette-overlay';
+    overlay.innerHTML = `
+      <div class="palette">
+        <input class="palette-input" type="text" placeholder="Choose worktree for active session…" spellcheck="false" />
+        <div class="palette-list"></div>
+      </div>`;
+    paletteEl = overlay;
+
+    const input = overlay.querySelector('.palette-input');
+    const listEl = overlay.querySelector('.palette-list');
+    let items = [];
+    let sel = 0;
+
+    function itemText(ctx) {
+      return [ctx.cwd, ctx.git?.branch, ctx.pr?.title, prLabel(ctx.pr)].filter(Boolean).join(' ');
+    }
+
+    function computeItems() {
+      const q = input.value.trim().toLowerCase();
+      items = !q
+        ? worktrees.slice()
+        : worktrees
+            .map((ctx) => ({ ctx, score: fuzzyScore(itemText(ctx).toLowerCase(), q) }))
+            .filter((item) => item.score > -Infinity)
+            .sort((a, b) => b.score - a.score)
+            .map((item) => item.ctx);
+      if (sel >= items.length) sel = Math.max(0, items.length - 1);
+    }
+
+    function highlight() {
+      [...listEl.children].forEach((child, i) => child.classList.toggle('active', i === sel));
+      listEl.children[sel]?.scrollIntoView({ block: 'nearest' });
+    }
+
+    function renderList() {
+      listEl.innerHTML = '';
+      if (!items.length) {
+        const empty = document.createElement('div');
+        empty.className = 'palette-empty';
+        empty.textContent = 'No matching worktree.';
+        listEl.appendChild(empty);
+        return;
+      }
+      items.forEach((ctx, i) => {
+        const row = document.createElement('div');
+        row.className = 'palette-item worktree-item' + (i === sel ? ' active' : '');
+        const name = document.createElement('span');
+        name.className = 'pi-name';
+        name.textContent = `${ctx.isMainWorktree ? 'main' : contextTitle(ctx)}`;
+        const detail = document.createElement('span');
+        detail.className = 'pi-path';
+        detail.textContent = `${gitLabel(ctx)} · ${prLabel(ctx.pr)} · ${prettyPath(ctx.cwd)}`;
+        row.append(name, detail);
+        row.onmouseenter = () => {
+          sel = i;
+          highlight();
+        };
+        row.onclick = () => choose(ctx);
+        listEl.appendChild(row);
+      });
+    }
+
+    function close(value = null) {
+      overlay.remove();
+      paletteEl = null;
+      document.removeEventListener('keydown', onKey, true);
+      resolve(value);
+    }
+
+    async function choose(ctx) {
+      active.session.cwd = ctx.cwd;
+      active.session.cwdSource = 'manual';
+      active.session.worktreeLocked = true;
+      if (!isManualName(active.session)) {
+        active.session.name = contextTitle(ctx);
+        active.session.nameSource = 'manual';
+        active.session.pinned = true;
+      }
+      sessionContexts.set(active.session.id, ctx);
+      await persist();
+      render();
+      close(ctx);
+    }
+
+    function onKey(e) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        close();
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (items.length) {
+          sel = (sel + 1) % items.length;
+          highlight();
+        }
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (items.length) {
+          sel = (sel - 1 + items.length) % items.length;
+          highlight();
+        }
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (items[sel]) choose(items[sel]);
+      }
+    }
+
+    input.addEventListener('input', () => {
+      computeItems();
+      renderList();
+    });
+    overlay.addEventListener('mousedown', (e) => {
+      if (e.target === overlay) close();
+    });
+    document.addEventListener('keydown', onKey, true);
+    document.body.appendChild(overlay);
+    computeItems();
+    renderList();
+    input.focus();
+  });
+}
+
+async function refreshActiveSessionContext() {
+  const active = activeSessionRecord();
+  if (!active) return;
+  scheduleContextRefresh(active.repo, active.session, 0);
+}
+
 async function renameRepo(repoId) {
   const repo = state.repos.find((r) => r.id === repoId);
   if (!repo) return;
@@ -369,6 +872,10 @@ async function addSession(repoId) {
   const session = {
     id: uid(),
     name: `session ${repo.sessions.length + 1}`,
+    nameSource: 'default',
+    cwd: repo.cwd,
+    cwdSource: 'default',
+    worktreeLocked: false,
     slug: newSlug(),
     pinned: false,
   };
@@ -386,7 +893,8 @@ async function renameSession(repoId, sessionId) {
   const name = await promptModal('Rename session', session.name);
   if (name) {
     session.name = name;
-    session.pinned = true; // manual name wins; stop following the auto-title
+    session.nameSource = 'manual';
+    session.pinned = true; // manual name wins; stop following auto/agent titles
     await persist();
     render();
   }
@@ -407,6 +915,12 @@ async function removeSession(repoId, sessionId) {
 
 // Tear down the local xterm; optionally kill the session's shell too.
 async function destroySession(session, killShell) {
+  const pendingContext = contextTimers.get(session.id);
+  if (pendingContext) clearTimeout(pendingContext);
+  contextTimers.delete(session.id);
+  contextRequests.delete(session.id);
+  sessionContexts.delete(session.id);
+
   const entry = terminals.get(session.id);
   if (entry) {
     try {
@@ -427,12 +941,18 @@ async function destroySession(session, killShell) {
 // ---------- selection ----------
 async function selectRepo(repoId) {
   state.activeRepoId = repoId;
+  const repo = state.repos.find((r) => r.id === repoId);
+  const session = repo?.sessions.find((s) => s.id === activeSessionId(repoId));
+  if (repo && session) scheduleContextRefresh(repo, session, 0);
   await persist();
   render();
 }
 async function selectSession(repoId, sessionId) {
   state.activeRepoId = repoId;
   state.activeSessionByRepo[repoId] = sessionId;
+  const repo = state.repos.find((r) => r.id === repoId);
+  const session = repo?.sessions.find((s) => s.id === sessionId);
+  if (repo && session) scheduleContextRefresh(repo, session, 0);
   await persist();
   render();
 }
@@ -546,7 +1066,7 @@ async function ensureTerminal(repo, session) {
 
   const { ptyId } = await api.startSession({
     slug: session.slug,
-    cwd: repo.cwd,
+    cwd: session.cwd || repo.cwd,
     cols: term.cols,
     rows: term.rows,
   });
@@ -561,6 +1081,7 @@ async function ensureTerminal(repo, session) {
     lastRows: term.rows,
     kittyStack: [], // kitty keyboard-protocol flags the running app has pushed
     kbTail: '', // carry an incomplete trailing escape across data chunks
+    oscTail: '', // carry an incomplete OSC 7 cwd sequence across data chunks
   };
   terminals.set(session.id, entry);
   ptyToSession.set(ptyId, session.id);
@@ -580,6 +1101,7 @@ async function ensureTerminal(repo, session) {
 function render() {
   renderTopbar();
   renderSidebar();
+  renderStatusbar();
   mountActive();
 }
 
@@ -672,17 +1194,50 @@ function renderSidebar() {
       moveSession(repo.id, draggedSessionId, s.id, placeAfter);
     });
 
+    const ctx = sessionContexts.get(s.id);
+    if (!ctx && !contextTimers.has(s.id)) scheduleContextRefresh(repo, s, 50);
+
     const dot = document.createElement('span');
     dot.className = 'dot' + (liveSlugs.has(s.slug) ? ' live' : '') + (busySessionIds.has(s.id) ? ' busy' : '');
     dot.dataset.sid = s.id;
+
+    const content = document.createElement('div');
+    content.className = 'session-content';
+    content.onclick = () => selectSession(repo.id, s.id);
 
     const name = document.createElement('span');
     name.className = 'session-name';
     name.dataset.sid = s.id;
     name.textContent = s.name;
-    name.title = s.pinned ? s.name : `${s.name} (auto-named — double-click to rename)`;
-    name.onclick = () => selectSession(repo.id, s.id);
-    name.ondblclick = () => renameSession(repo.id, s.id);
+    name.title = contextTooltip(s, ctx);
+    name.ondblclick = (e) => {
+      e.stopPropagation();
+      renameSession(repo.id, s.id);
+    };
+
+    const meta = document.createElement('div');
+    meta.className = 'session-meta';
+    meta.title = contextTooltip(s, ctx);
+
+    const branch = document.createElement('span');
+    branch.className = 'session-branch';
+    branch.textContent = gitLabel(ctx);
+    meta.appendChild(branch);
+
+    if (ctx?.git?.isRepo) {
+      const pr = document.createElement('button');
+      pr.className = `session-pr ${prClass(ctx.pr)}`;
+      pr.textContent = prLabel(ctx.pr);
+      pr.title = ctx.pr?.lookupState === 'found' ? `${ctx.pr.title}\n${ctx.pr.url}` : prLabel(ctx.pr);
+      pr.disabled = ctx.pr?.lookupState !== 'found' || !ctx.pr.url;
+      pr.onclick = (e) => {
+        e.stopPropagation();
+        if (ctx.pr?.url) void api.openExternalUrl(ctx.pr.url).catch(() => {});
+      };
+      meta.appendChild(pr);
+    }
+
+    content.append(name, meta);
 
     const x = document.createElement('button');
     x.className = 'session-x';
@@ -693,7 +1248,7 @@ function renderSidebar() {
       removeSession(repo.id, s.id);
     };
 
-    item.append(dot, name, x);
+    item.append(dot, content, x);
     list.appendChild(item);
   }
   el.sidebar.appendChild(list);
@@ -703,6 +1258,62 @@ function renderSidebar() {
   add.textContent = '+ New session';
   add.onclick = () => addSession(repo.id);
   el.sidebar.appendChild(add);
+}
+
+function renderStatusbar() {
+  el.statusbar.innerHTML = '';
+  const repo = activeRepo();
+  const sid = repo ? activeSessionId(repo.id) : null;
+  const session = sid ? repo.sessions.find((s) => s.id === sid) : null;
+  if (!repo || !session) {
+    el.statusbar.classList.add('empty-status');
+    el.statusbar.textContent = '';
+    return;
+  }
+
+  el.statusbar.classList.remove('empty-status');
+  const ctx = sessionContexts.get(session.id);
+  if (!ctx && !contextTimers.has(session.id)) scheduleContextRefresh(repo, session, 50);
+
+  const parts = [];
+  const repoName = document.createElement('span');
+  repoName.className = 'status-repo';
+  repoName.textContent = repo.name;
+  parts.push(repoName);
+
+  const cwd = document.createElement('span');
+  cwd.className = 'status-cwd';
+  cwd.textContent = prettyPath(session.cwd || repo.cwd);
+  cwd.title = session.cwd || repo.cwd;
+  parts.push(cwd);
+
+  const branch = document.createElement('span');
+  branch.className = 'status-branch';
+  branch.textContent = gitLabel(ctx);
+  branch.title = ctx?.git?.isRepo ? ctx.git.worktreeRoot : '';
+  parts.push(branch);
+
+  if (ctx?.git?.isRepo) {
+    const pr = document.createElement('button');
+    pr.className = `status-pr ${prClass(ctx.pr)}`;
+    pr.textContent = prLabel(ctx.pr);
+    pr.disabled = ctx.pr?.lookupState !== 'found' || !ctx.pr.url;
+    pr.title = ctx.pr?.lookupState === 'found' ? `${ctx.pr.title}\n${ctx.pr.url}` : prLabel(ctx.pr);
+    pr.onclick = () => {
+      if (ctx.pr?.url) void api.openExternalUrl(ctx.pr.url).catch(() => {});
+    };
+    parts.push(pr);
+  }
+
+  parts.forEach((part, index) => {
+    if (index > 0) {
+      const sep = document.createElement('span');
+      sep.className = 'status-sep';
+      sep.textContent = '·';
+      el.statusbar.appendChild(sep);
+    }
+    el.statusbar.appendChild(part);
+  });
 }
 
 async function mountActive() {
@@ -765,6 +1376,50 @@ function currentKittyFlags(entry) {
   return s.length ? s[s.length - 1] : 0;
 }
 
+function parseOsc7Cwd(payload) {
+  const raw = String(payload || '').trim();
+  if (!raw) return null;
+  if (!raw.startsWith('file://')) return null;
+  try {
+    return decodeURIComponent(new URL(raw).pathname);
+  } catch {
+    const withoutScheme = raw.replace(/^file:\/\/[^/]*/, '');
+    try {
+      return decodeURIComponent(withoutScheme);
+    } catch {
+      return withoutScheme;
+    }
+  }
+}
+
+function trackSessionCwd(entry, data, sessionId) {
+  const found = findSession(sessionId);
+  if (!found) return;
+  const buf = (entry.oscTail || '') + data;
+  const re = /\x1b\]7;([^\x07\x1b]*)(?:\x07|\x1b\\)/g;
+  let match;
+  let latestCwd = null;
+  while ((match = re.exec(buf))) {
+    const cwd = parseOsc7Cwd(match[1]);
+    if (cwd && cwd.startsWith('/')) latestCwd = cwd;
+  }
+
+  const lastStart = buf.lastIndexOf('\x1b]7;');
+  const lastBel = buf.lastIndexOf('\x07');
+  const lastSt = buf.lastIndexOf('\x1b\\');
+  entry.oscTail = lastStart > Math.max(lastBel, lastSt) ? buf.slice(lastStart, lastStart + 512) : '';
+
+  if (!latestCwd || found.session.worktreeLocked || found.session.cwdSource === 'manual') return;
+  const changed = found.session.cwd !== latestCwd;
+  const becameObserved = found.session.cwdSource !== 'observed';
+  found.session.cwd = latestCwd;
+  found.session.cwdSource = 'observed';
+  if (!changed && !becameObserved) return;
+  persistSoon();
+  scheduleContextRefresh(found.repo, found.session, 100);
+  renderStatusbar();
+}
+
 function trackKittyKeyboard(entry, data) {
   const buf = (entry.kbTail || '') + data;
   let m;
@@ -792,6 +1447,7 @@ function trackKittyKeyboard(entry, data) {
 }
 
 window.addEventListener('resize', fitActive);
+window.addEventListener('focus', () => refreshAllSessionContexts(0));
 
 // Draggable divider: resize the sidebar, persist the width, refit live.
 function applySidebarWidth() {
@@ -848,6 +1504,7 @@ async function init() {
     const entry = sessionId && terminals.get(sessionId);
     if (!entry) return;
     markSessionBusy(sessionId);
+    trackSessionCwd(entry, data, sessionId); // follow the shell's actual cwd/worktree
     trackKittyKeyboard(entry, data); // watch the app's keyboard-protocol negotiation
     // Follow the tail: if the user is already at the bottom, keep them there after
     // this output — so a full redraw (e.g. an app's /reload) lands on the latest
@@ -870,12 +1527,14 @@ async function init() {
     const entry = sessionId && terminals.get(sessionId);
     if (entry) entry.term.write('\r\n\x1b[90m[process exited — reopen to restart]\x1b[0m\r\n');
   });
+  api.onExternalContextUpdate((update) => applyExternalContextUpdate(update));
 
   // Shortcuts routed from the native menu (main process).
   api.onMenu(async (action) => {
-    if (paletteEl && action !== 'palette') return;
+    if (paletteEl && action !== 'palette' && action !== 'command-palette') return;
     const repo = activeRepo();
     if (action === 'palette') openPalette();
+    else if (action === 'command-palette') openCommandPalette();
     else if (action === 'new-session') {
       if (repo) addSession(repo.id);
     } else if (action === 'close-session') {
@@ -926,7 +1585,9 @@ async function init() {
 
   const loaded = await api.loadState();
   if (loaded && Array.isArray(loaded.repos)) state = loaded;
+  normalizeStateShape();
   liveSlugs = new Set(await api.listSessions());
+  refreshAllSessionContexts();
   applySidebarWidth();
   initResizer();
   render();

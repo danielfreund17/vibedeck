@@ -3,7 +3,7 @@
 A lean terminal, organized in two dimensions.
 
 - **Scopes** (top bar) — one per project/folder. Switching scopes swaps which sessions you see.
-- **Sessions** (left bar) — terminal tabs within the active scope. Run whatever you like in them: a shell, a coding agent, a dev server.
+- **Sessions** (left bar) — terminal tabs within the active scope. Run whatever you like in them: a shell, a coding agent, a dev server. Session tabs track their current worktree, branch, and GitHub PR state when available.
 
 Each session is your login shell running on its own pty, wired straight to the terminal — the same way a native terminal (Warp/iTerm/VS Code) works — so rendering is clean and fast, and modern TUIs (Claude Code, pi, …) behave exactly as they would anywhere else.
 
@@ -54,6 +54,9 @@ Electron renderer (UI)  ──IPC──►  main process  ──►  node-pty  �
 
 - Each session is a login shell on a dedicated pty; the terminal (xterm.js) talks straight to it — no multiplexer in between.
 - The app owns the scope→session model in `state.json` (in Electron's userData dir). That layout persists; the shells don't.
+- VibeDeck tracks each session's current directory via terminal OSC 7 prompt integration, so worktree branch/PR badges follow the session even after `cd`.
+- GitHub PR badges use the local `gh` CLI when it is installed and authenticated; failures degrade to a subtle unavailable state.
+- The optional `integrations/pi/vibedeck-session-title.ts` companion extension lets pi emit contextual terminal titles so VibeDeck can auto-name tabs from the first meaningful prompt.
 - VibeDeck speaks the [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) so modified keys (like Shift+Enter) reach apps unambiguously, and ⌘V pastes a clipboard **image** as a temp-file path so agents can attach it.
 
 ## Keyboard
