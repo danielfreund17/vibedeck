@@ -10,9 +10,16 @@ contextBridge.exposeInMainWorld('api', {
   pickFolder: () => ipcRenderer.invoke('dialog:pickFolder'),
   listSessions: () => ipcRenderer.invoke('sessions:live'),
   scanRepos: (parents) => ipcRenderer.invoke('repos:scan', parents),
+  resolveSessionContext: (cwd) => ipcRenderer.invoke('session:resolveContext', cwd),
+  listWorktrees: (repoCwd) => ipcRenderer.invoke('session:listWorktrees', repoCwd),
   clipWrite: (text) => ipcRenderer.invoke('clipboard:write', text),
   clipRead: () => ipcRenderer.invoke('clipboard:read'),
   clipReadImage: () => ipcRenderer.invoke('clipboard:readImage'),
+  openExternalUrl: (url) => ipcRenderer.invoke('shell:openExternalUrl', url),
+
+  saveSnapshot: () => ipcRenderer.invoke('snapshot:save'),
+  listSnapshots: () => ipcRenderer.invoke('snapshot:list'),
+  planSnapshotRestore: (name) => ipcRenderer.invoke('snapshot:plan', name),
 
   startSession: (opts) => ipcRenderer.invoke('session:start', opts),
   killSession: (slug, ptyId) => ipcRenderer.invoke('session:kill', { slug, ptyId }),
@@ -21,5 +28,6 @@ contextBridge.exposeInMainWorld('api', {
 
   onData: (cb) => ipcRenderer.on('session:data', (_e, payload) => cb(payload)),
   onExit: (cb) => ipcRenderer.on('session:exit', (_e, payload) => cb(payload)),
+  onExternalContextUpdate: (cb) => ipcRenderer.on('session:externalContextUpdate', (_e, payload) => cb(payload)),
   onMenu: (cb) => ipcRenderer.on('menu-action', (_e, action) => cb(action)),
 });

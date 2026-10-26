@@ -126,8 +126,10 @@ body {
   gap: 8px;
   padding: 7px 8px;
   border-radius: 7px;
-  cursor: pointer;
+  cursor: grab;
   color: var(--fg-dim);
+  user-select: none;
+  min-width: 0;
 }
 .session:hover {
   background: var(--bg-3);
@@ -136,6 +138,24 @@ body {
   background: var(--bg-active);
   color: var(--fg);
 }
+.session.dragging {
+  cursor: grabbing;
+  opacity: 0.45;
+}
+.session.drop-before {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+.session.drop-after {
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+.session-content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  cursor: pointer;
+}
 .session-name {
   flex: 1;
   font-size: 13px;
@@ -143,7 +163,63 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.session-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.2;
+  color: var(--fg-dim);
+}
+.session-branch {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-pr,
+.status-pr {
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 0 5px;
+  background: rgba(138, 144, 160, 0.12);
+  color: var(--fg-dim);
+  font: inherit;
+  white-space: nowrap;
+}
+.session-pr:not(:disabled),
+.status-pr:not(:disabled) {
+  cursor: pointer;
+}
+.session-pr.pr-open,
+.status-pr.pr-open {
+  color: #9fb5ff;
+  background: rgba(109, 140, 255, 0.14);
+}
+.session-pr.pr-draft,
+.status-pr.pr-draft {
+  color: #c7a4ff;
+  background: rgba(178, 132, 255, 0.14);
+}
+.session-pr.pr-merged,
+.status-pr.pr-merged {
+  color: var(--live);
+  background: rgba(61, 220, 132, 0.14);
+}
+.session-pr.pr-closed,
+.status-pr.pr-closed,
+.session-pr.pr-error,
+.status-pr.pr-error {
+  color: var(--danger);
+  background: rgba(255, 107, 107, 0.12);
+}
+.session-pr.pr-none,
+.status-pr.pr-none {
+  color: #6f7686;
+}
 .dot {
+  position: relative;
   width: 7px;
   height: 7px;
   border-radius: 50%;
@@ -152,6 +228,37 @@ body {
 }
 .dot.live {
   background: var(--live);
+}
+.dot.busy {
+  width: 13px;
+  height: 13px;
+  background: transparent;
+  animation: session-dot-spin 0.9s linear infinite;
+}
+.dot.busy::before,
+.dot.busy::after {
+  content: '';
+  position: absolute;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--live);
+}
+.dot.busy::before {
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  box-shadow:
+    -4px 8px 0 rgba(61, 220, 132, 0.55),
+    4px 8px 0 rgba(61, 220, 132, 0.8);
+}
+.dot.busy::after {
+  display: none;
+}
+@keyframes session-dot-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .btn {
@@ -205,7 +312,7 @@ body.resizing .terminals {
 }
 .terminals {
   position: absolute;
-  inset: 0;
+  inset: 0 0 24px 0;
 }
 .term {
   position: absolute;
@@ -232,7 +339,7 @@ body.resizing .terminals {
 
 .empty {
   position: absolute;
-  inset: 0;
+  inset: 0 0 24px 0;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -250,6 +357,50 @@ body.resizing .terminals {
 }
 .empty-sub {
   font-size: 13px;
+}
+
+.session-statusbar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--fg-dim);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.session-statusbar.empty-status {
+  display: none;
+}
+.status-repo {
+  color: var(--fg);
+  font-weight: 600;
+}
+.status-cwd,
+.status-branch {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.status-cwd {
+  max-width: 42%;
+}
+.status-branch {
+  color: #b8becd;
+}
+.status-sep {
+  color: #555c69;
+  flex-shrink: 0;
+}
+.status-pr {
+  font-size: 11px;
 }
 
 /* ---- modal ---- */
@@ -300,6 +451,33 @@ body.resizing .terminals {
 }
 .btn-ghost {
   background: transparent;
+}
+.modal:has(.modal-body) {
+  width: 440px;
+}
+.modal-body {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--fg-dim, #a0a4b0);
+  white-space: pre-wrap;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+/* ---- toast ---- */
+.toast {
+  position: fixed;
+  right: 18px;
+  bottom: 36px;
+  max-width: 460px;
+  padding: 10px 14px;
+  border-radius: 9px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  font-size: 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  z-index: 200;
 }
 
 /* ---- command palette ---- */

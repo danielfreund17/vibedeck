@@ -1,15 +1,19 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, Menu, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Menu, clipboard, shell: electronShell } = require('electron');
+const { execFile } = require('child_process');
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
 const fs = require('fs');
 const state = require('./state');
 const shell = require('./shell');
+const snap = require('./snapshot');
+const store = require('./snapshot-store');
 
 // Keep dev (`npm start`) and the packaged .app pointed at the same state/config.
-app.setPath('userData', path.join(app.getPath('appData'), 'vibedeck'));
+// VIBEDECK_USER_DATA points a dev/test run at a throwaway state dir instead.
+app.setPath('userData', process.env.VIBEDECK_USER_DATA || path.join(app.getPath('appData'), 'vibedeck'));
 
 let mainWindow = null;
 
@@ -17,9 +21,49 @@ let mainWindow = null;
 // is the app's durable session id (its layout persists in state; the shell
 // doesn't survive a restart).
 const ptys = new Map();
+let sessionUpdateWatcher = null;
 
 function userDataDir() {
   return app.getPath('userData');
+}
+
+function sessionUpdatesDir() {
+  return path.join(userDataDir(), 'session-updates');
+}
+
+function agentRegistryDir() {
+  return store.agentRegistryDir(userDataDir());
+}
+
+// ---- session snapshots (which agent conversation runs in which tab) ----
+
+const DAILY_CHECK_INTERVAL_MS = 15 * 60 * 1000;
+let dailySnapshotTimer = null;
+let quitSnapshotTaken = false;
+
+// [{ slug, pid }] for every tab whose shell is alive in this app run.
+function liveShells() {
+  return [...ptys.values()].map(({ slug, proc }) => ({ slug, pid: proc.pid })).filter((s) => s.pid);
+}
+
+function safeTakeSnapshot(trigger) {
+  try {
+    return store.takeSnapshot(userDataDir(), liveShells(), trigger);
+  } catch (error) {
+    console.error(`[vibedeck] ${trigger} snapshot failed:`, error);
+    return { saved: false, trigger, error: String(error?.message || error) };
+  }
+}
+
+// Once per local calendar day. Retries every interval until a day's snapshot
+// lands (e.g. when nothing was running yet at the first check).
+function maybeTakeDailySnapshot() {
+  if (!snap.hasDailyFor(store.listSnapshotNames(userDataDir()))) safeTakeSnapshot('daily');
+}
+
+function startDailySnapshots() {
+  setTimeout(maybeTakeDailySnapshot, 2 * 60 * 1000); // let restored agents start first
+  dailySnapshotTimer = setInterval(maybeTakeDailySnapshot, DAILY_CHECK_INTERVAL_MS);
 }
 
 // Scan registered parent folders one level deep for git repositories.
@@ -48,6 +92,263 @@ function scanRepos(parentFolders) {
   }
   out.sort((a, b) => a.name.localeCompare(b.name));
   return out;
+}
+
+function execText(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      command,
+      args,
+      { timeout: options.timeout || 5000, maxBuffer: 1024 * 1024, cwd: options.cwd },
+      (error, stdout, stderr) => {
+        if (error) {
+          error.stderr = stderr;
+          reject(error);
+          return;
+        }
+        resolve(String(stdout || '').trim());
+      }
+    );
+  });
+}
+
+async function tryExecText(command, args, options) {
+  try {
+    return await execText(command, args, options);
+  } catch {
+    return null;
+  }
+}
+
+async function git(cwd, args) {
+  return execText('git', ['-C', cwd, ...args], { timeout: 5000 });
+}
+
+async function tryGit(cwd, args) {
+  try {
+    return await git(cwd, args);
+  } catch {
+    return null;
+  }
+}
+
+function parseRemoteUrl(raw) {
+  const remote = String(raw || '').trim();
+  if (!remote) return null;
+
+  let match = remote.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/);
+  if (match) return { owner: match[1], repo: match[2], url: `https://github.com/${match[1]}/${match[2]}` };
+
+  match = remote.match(/^https:\/\/github\.com\/([^/]+)\/(.+?)(?:\.git)?$/);
+  if (match) return { owner: match[1], repo: match[2], url: `https://github.com/${match[1]}/${match[2]}` };
+
+  match = remote.match(/^ssh:\/\/git@github\.com\/([^/]+)\/(.+?)(?:\.git)?$/);
+  if (match) return { owner: match[1], repo: match[2], url: `https://github.com/${match[1]}/${match[2]}` };
+
+  return null;
+}
+
+function parseBranchStatus(statusText) {
+  const lines = String(statusText || '').split('\n').filter(Boolean);
+  const header = lines.find((line) => line.startsWith('##')) || '';
+  const dirty = lines.some((line) => !line.startsWith('##'));
+  const ahead = Number(header.match(/ahead (\d+)/)?.[1] || 0);
+  const behind = Number(header.match(/behind (\d+)/)?.[1] || 0);
+  return { dirty, ahead, behind };
+}
+
+function parseWorktrees(porcelain) {
+  const worktrees = [];
+  let current = null;
+  for (const line of String(porcelain || '').split('\n')) {
+    if (!line.trim()) {
+      if (current) worktrees.push(current);
+      current = null;
+      continue;
+    }
+    if (line.startsWith('worktree ')) current = { path: line.slice('worktree '.length), branch: null, head: null };
+    else if (current && line.startsWith('HEAD ')) current.head = line.slice('HEAD '.length);
+    else if (current && line.startsWith('branch refs/heads/')) current.branch = line.slice('branch refs/heads/'.length);
+  }
+  if (current) worktrees.push(current);
+  return worktrees;
+}
+
+function tokens(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/^[πp]i\s*-\s*/i, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(/\s+/)
+    .filter((token) => token.length > 2 && !['session', 'dirty', 'fix', 'feat', 'feature', 'chat', 'cxllm'].includes(token));
+}
+
+function scoreWorktree(sessionName, candidateText) {
+  const queryTokens = tokens(sessionName);
+  if (!queryTokens.length) return 0;
+  const haystack = String(candidateText || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ');
+  let score = 0;
+  for (const token of queryTokens) {
+    if (haystack.includes(token)) score += token.length >= 6 ? 3 : 2;
+  }
+  const phrase = queryTokens.join(' ');
+  if (phrase && haystack.includes(phrase)) score += 5;
+  return score;
+}
+
+const prCache = new Map();
+const PR_CACHE_TTL_MS = 60 * 1000;
+
+async function resolvePrContext(remote, branch, headSha) {
+  if (!remote || !branch) return { lookupState: 'none' };
+
+  const cacheKey = `${remote.owner}/${remote.repo}:${branch}:${headSha || ''}`;
+  const cached = prCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < PR_CACHE_TTL_MS) return cached.value;
+
+  let value;
+  try {
+    const output = await execText(
+      'gh',
+      [
+        'pr',
+        'list',
+        '--repo',
+        `${remote.owner}/${remote.repo}`,
+        '--head',
+        branch,
+        '--state',
+        'all',
+        '--json',
+        'number,state,isDraft,title,url,headRefName,baseRefName,mergedAt,closedAt,updatedAt',
+        '--limit',
+        '20',
+      ],
+      { timeout: 8000 }
+    );
+    const prs = JSON.parse(output || '[]');
+    const exact = prs.filter((pr) => pr.headRefName === branch);
+    const pr = (exact.length ? exact : prs).sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))[0];
+    value = pr
+      ? {
+          lookupState: 'found',
+          number: pr.number,
+          state: pr.state,
+          isDraft: Boolean(pr.isDraft),
+          title: pr.title || '',
+          url: pr.url || '',
+          updatedAt: pr.updatedAt || null,
+        }
+      : { lookupState: 'none' };
+  } catch (error) {
+    value = { lookupState: 'error', message: error.code === 'ENOENT' ? 'GitHub CLI not found' : 'PR lookup failed' };
+  }
+
+  prCache.set(cacheKey, { fetchedAt: Date.now(), value });
+  return value;
+}
+
+async function resolveGitContextForCwd(cwd, cwdSource = 'observed') {
+  const requestedCwd = String(cwd || os.homedir());
+  const resolvedCwd = fs.existsSync(requestedCwd) ? requestedCwd : os.homedir();
+
+  const worktreeRoot = await tryGit(resolvedCwd, ['rev-parse', '--show-toplevel']);
+  if (!worktreeRoot) {
+    return { cwd: resolvedCwd, cwdSource, git: { isRepo: false }, pr: { lookupState: 'none' } };
+  }
+
+  const [commonGitDir, branchRaw, headSha, shortSha, statusText, remoteRaw] = await Promise.all([
+    tryGit(worktreeRoot, ['rev-parse', '--git-common-dir']),
+    tryGit(worktreeRoot, ['branch', '--show-current']),
+    tryGit(worktreeRoot, ['rev-parse', 'HEAD']),
+    tryGit(worktreeRoot, ['rev-parse', '--short=8', 'HEAD']),
+    tryGit(worktreeRoot, ['status', '--porcelain=v1', '--branch']),
+    tryGit(worktreeRoot, ['remote', 'get-url', 'origin']),
+  ]);
+
+  const branch = branchRaw || null;
+  const remote = parseRemoteUrl(remoteRaw);
+  const branchStatus = parseBranchStatus(statusText);
+  const pr = await resolvePrContext(remote, branch, headSha);
+
+  return {
+    cwd: resolvedCwd,
+    cwdSource,
+    git: {
+      isRepo: true,
+      worktreeRoot,
+      commonGitDir: commonGitDir || null,
+      repoName: path.basename(worktreeRoot),
+      branch,
+      headSha: headSha || null,
+      shortSha: shortSha || null,
+      remote,
+      ...branchStatus,
+    },
+    pr,
+  };
+}
+
+async function inferWorktreeContext(repoCwd, sessionName) {
+  const porcelain = await tryGit(repoCwd, ['worktree', 'list', '--porcelain']);
+  const worktrees = parseWorktrees(porcelain).filter((wt) => wt.path && wt.path !== repoCwd);
+  if (!worktrees.length) return null;
+
+  const remoteRaw = await tryGit(repoCwd, ['remote', 'get-url', 'origin']);
+  const remote = parseRemoteUrl(remoteRaw);
+  const candidates = await Promise.all(
+    worktrees.map(async (wt) => {
+      const pr = await resolvePrContext(remote, wt.branch, wt.head);
+      const text = [wt.branch, wt.path, pr.lookupState === 'found' ? pr.title : ''].filter(Boolean).join(' ');
+      return { wt, pr, score: scoreWorktree(sessionName, text) };
+    })
+  );
+
+  candidates.sort((a, b) => b.score - a.score);
+  const best = candidates[0];
+  const next = candidates[1];
+  if (!best || best.score < 2 || (next && best.score === next.score)) return null;
+
+  const ctx = await resolveGitContextForCwd(best.wt.path, 'inferred');
+  return { ...ctx, pr: best.pr.lookupState === 'found' ? best.pr : ctx.pr };
+}
+
+async function resolveSessionContext(input) {
+  const options = typeof input === 'object' && input !== null ? input : { cwd: input };
+  const cwd = options.cwd || os.homedir();
+  const repoCwd = options.repoCwd || cwd;
+  const cwdSource = options.cwdSource || 'observed';
+
+  if (cwdSource === 'default' && repoCwd && cwd === repoCwd) {
+    const inferred = await inferWorktreeContext(repoCwd, options.sessionName || '');
+    if (inferred) return inferred;
+
+    const worktrees = parseWorktrees(await tryGit(repoCwd, ['worktree', 'list', '--porcelain']));
+    if (worktrees.length > 1) {
+      return {
+        cwd: repoCwd,
+        cwdSource: 'default',
+        git: { isRepo: false, unknownWorktree: true, worktreeCount: worktrees.length - 1 },
+        pr: { lookupState: 'none' },
+      };
+    }
+  }
+
+  return resolveGitContextForCwd(cwd, cwdSource);
+}
+
+async function listWorktreeContexts(repoCwd) {
+  const root = await tryGit(repoCwd, ['rev-parse', '--show-toplevel']);
+  if (!root) return [];
+  const worktrees = parseWorktrees(await tryGit(root, ['worktree', 'list', '--porcelain']));
+  const contexts = await Promise.all(
+    worktrees.map(async (worktree) => {
+      const ctx = await resolveGitContextForCwd(worktree.path, 'manual');
+      return { ...ctx, isMainWorktree: worktree.path === root };
+    })
+  );
+  contexts.sort((a, b) => Number(b.isMainWorktree) - Number(a.isMainWorktree) || String(a.cwd).localeCompare(String(b.cwd)));
+  return contexts;
 }
 
 function createWindow() {
@@ -86,7 +387,8 @@ function createWindow() {
       action = 'new-session'; // Ctrl+Shift+` — new session (VS Code style)
     } else if (input.meta && input.shift) {
       // brackets = horizontal (scopes); ' \ = vertical (sessions)
-      if (input.code === 'BracketLeft') action = 'prev-scope';
+      if ((input.key || '').toLowerCase() === 'p') action = 'command-palette';
+      else if (input.code === 'BracketLeft') action = 'prev-scope';
       else if (input.code === 'BracketRight') action = 'next-scope';
       else if (input.code === 'Quote') action = 'prev-session';
       else if (input.code === 'Backslash') action = 'next-session';
@@ -110,10 +412,37 @@ function sendMenu(action) {
   }
 }
 
+function shellIntegrationScript() {
+  // Emit OSC 7 (current directory) on each prompt so the renderer can track the
+  // session's real cwd/worktree without modifying user dotfiles.
+  return [
+    '__vibedeck_emit_cwd() {',
+    '  printf \'\\033]7;file://%s%s\\007\' "$(hostname 2>/dev/null || printf localhost)" "$PWD"',
+    '}',
+    'if [ -n "${ZSH_VERSION-}" ]; then',
+    '  autoload -Uz add-zsh-hook 2>/dev/null || true',
+    '  if command -v add-zsh-hook >/dev/null 2>&1; then',
+    '    add-zsh-hook precmd __vibedeck_emit_cwd 2>/dev/null || true',
+    '  else',
+    '    case " ${precmd_functions[*]-} " in',
+    '      *" __vibedeck_emit_cwd "*) ;;',
+    '      *) precmd_functions+=(__vibedeck_emit_cwd) ;;',
+    '    esac',
+    '  fi',
+    'elif [ -n "${BASH_VERSION-}" ]; then',
+    '  case ";${PROMPT_COMMAND-};" in',
+    '    *";__vibedeck_emit_cwd;"*) ;;',
+    '    *) PROMPT_COMMAND="__vibedeck_emit_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;',
+    '  esac',
+    'fi',
+    '__vibedeck_emit_cwd',
+  ].join('\n');
+}
+
 // After a session's shell settles at its first prompt (output goes quiet), cd it
 // into the repo. `builtin cd` bypasses shell `cd` wrappers (e.g. RVM's), and
 // waiting for quiet avoids racing shell startup.
-function scheduleInitialCd(proc, dir) {
+function scheduleInitialCd(proc, dir, initialCommand) {
   const quoted = `'${String(dir).replace(/'/g, `'\\''`)}'`;
   let timer = null;
   let done = false;
@@ -123,7 +452,8 @@ function scheduleInitialCd(proc, dir) {
     timer = setTimeout(() => {
       done = true;
       try {
-        proc.write(`builtin cd -- ${quoted} && clear\r`);
+        const then = initialCommand ? ` && ${initialCommand}` : '';
+        proc.write(`${shellIntegrationScript()}\rbuiltin cd -- ${quoted} && clear${then}\r`);
       } catch {
         /* pty gone */
       }
@@ -163,9 +493,13 @@ function buildMenu() {
     {
       label: 'Go',
       submenu: [
-        item('Command Palette', 'Cmd+P', 'palette'),
+        item('Open Repo Palette', 'Cmd+P', 'palette'),
+        item('Command Palette', 'Cmd+Shift+P', 'command-palette'),
         item('New Session', 'Cmd+T', 'new-session'),
         item('Close Active Session', 'Cmd+W', 'close-session'),
+        { type: 'separator' },
+        item('Save Session Snapshot', undefined, 'snapshot-save'),
+        item('Restore Latest Snapshot…', undefined, 'snapshot-restore-latest'),
         { type: 'separator' },
         item('Previous Scope', 'Cmd+Shift+[', 'prev-scope'),
         item('Next Scope', 'Cmd+Shift+]', 'next-scope'),
@@ -192,6 +526,8 @@ function buildMenu() {
 app.whenReady().then(() => {
   createWindow();
   buildMenu();
+  startSessionUpdateWatcher();
+  startDailySnapshots();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -203,6 +539,17 @@ app.on('window-all-closed', () => {
 
 // Kill every session's shell on quit — nothing persists past the app.
 app.on('before-quit', () => {
+  // Snapshot before the shells (and their agents) are killed below.
+  if (!quitSnapshotTaken) {
+    quitSnapshotTaken = true;
+    safeTakeSnapshot('quit');
+  }
+  if (dailySnapshotTimer) clearInterval(dailySnapshotTimer);
+  try {
+    sessionUpdateWatcher?.close();
+  } catch {
+    /* noop */
+  }
   for (const { proc } of ptys.values()) {
     try {
       proc.kill();
@@ -211,6 +558,41 @@ app.on('before-quit', () => {
     }
   }
 });
+
+function readSessionUpdate(fileName) {
+  if (!fileName || !fileName.endsWith('.json')) return;
+  const file = path.join(sessionUpdatesDir(), fileName);
+  setTimeout(() => {
+    let update;
+    try {
+      update = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      return;
+    }
+    if (!update || typeof update.slug !== 'string' || !update.cwd) return;
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('session:externalContextUpdate', update);
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      /* best effort cleanup */
+    }
+  }, 50);
+}
+
+function startSessionUpdateWatcher() {
+  const dir = sessionUpdatesDir();
+  fs.mkdirSync(dir, { recursive: true });
+  try {
+    sessionUpdateWatcher = fs.watch(dir, (_event, fileName) => readSessionUpdate(fileName));
+  } catch {
+    sessionUpdateWatcher = null;
+  }
+  try {
+    for (const fileName of fs.readdirSync(dir)) readSessionUpdate(fileName);
+  } catch {
+    /* noop */
+  }
+}
 
 // ---- app info ----
 ipcMain.handle('app:info', () => ({ hostname: os.hostname(), homedir: os.homedir() }));
@@ -221,6 +603,20 @@ ipcMain.handle('clipboard:write', (_e, text) => {
   return true;
 });
 ipcMain.handle('clipboard:read', () => clipboard.readText());
+
+// Open terminal links in the user's default browser. Only allow web URLs; terminal
+// output is untrusted and must not be able to launch arbitrary app protocols.
+ipcMain.handle('shell:openExternalUrl', async (_e, rawUrl) => {
+  let url;
+  try {
+    url = new URL(String(rawUrl ?? ''));
+  } catch {
+    return false;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+  await electronShell.openExternal(url.toString());
+  return true;
+});
 
 // If the clipboard holds an image, stash it as a temp PNG and return the path so
 // the renderer can type it into the terminal — Claude Code / pi read an image
@@ -274,9 +670,25 @@ ipcMain.handle('sessions:live', () => shell.listSessions());
 // ---- repo discovery under registered parent folders ----
 ipcMain.handle('repos:scan', (_e, parentFolders) => scanRepos(parentFolders));
 
+// ---- session intelligence ----
+ipcMain.handle('session:resolveContext', (_e, cwd) => resolveSessionContext(cwd));
+ipcMain.handle('session:listWorktrees', (_e, repoCwd) => listWorktreeContexts(repoCwd));
+
 // ---- sessions ----
-ipcMain.handle('session:start', (_e, { slug, cwd, cols, rows }) => {
-  const { proc, isNew, startDir } = shell.spawnSession({ slug, cwd, cols, rows });
+// ---- snapshots ----
+ipcMain.handle('snapshot:save', () => safeTakeSnapshot('manual'));
+ipcMain.handle('snapshot:list', () => store.snapshotSummaries(userDataDir()));
+ipcMain.handle('snapshot:plan', (_e, name) => store.planSnapshotRestore(userDataDir(), liveShells(), name));
+
+ipcMain.handle('session:start', (_e, { slug, cwd, cols, rows, initialCommand }) => {
+  const { proc, isNew, startDir } = shell.spawnSession({
+    slug,
+    cwd,
+    cols,
+    rows,
+    updatesDir: sessionUpdatesDir(),
+    agentsDir: agentRegistryDir(),
+  });
   const ptyId = crypto.randomUUID();
   ptys.set(ptyId, { proc, slug });
 
@@ -294,7 +706,8 @@ ipcMain.handle('session:start', (_e, { slug, cwd, cols, rows }) => {
 
   // Some shells cd on startup (RVM/oh-my-zsh here), overriding the pty's cwd.
   // Once the shell settles at its first prompt, cd into the repo.
-  if (isNew) scheduleInitialCd(proc, startDir);
+  // initialCommand (snapshot restore) runs right after that cd.
+  if (isNew) scheduleInitialCd(proc, startDir, typeof initialCommand === 'string' ? initialCommand : null);
 
   return { ptyId };
 });

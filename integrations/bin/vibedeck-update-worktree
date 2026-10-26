@@ -1,0 +1,118 @@
+#!/usr/bin/env node
+'use strict';
+
+const { execFileSync } = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
+
+function tryExec(command, args, cwd) {
+  try {
+    return execFileSync(command, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch {
+    return '';
+  }
+}
+
+function truncate(text, max) {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function parseRemote(raw) {
+  const remote = String(raw || '').trim();
+  let match = remote.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/);
+  if (match) return `${match[1]}/${match[2]}`;
+  match = remote.match(/^https:\/\/github\.com\/([^/]+)\/(.+?)(?:\.git)?$/);
+  if (match) return `${match[1]}/${match[2]}`;
+  match = remote.match(/^ssh:\/\/git@github\.com\/([^/]+)\/(.+?)(?:\.git)?$/);
+  if (match) return `${match[1]}/${match[2]}`;
+  return '';
+}
+
+function defaultUpdatesDir() {
+  if (process.platform === 'darwin') {
+    return path.join(process.env.HOME || process.cwd(), 'Library/Application Support/vibedeck/session-updates');
+  }
+  return path.join(process.env.XDG_CONFIG_HOME || path.join(process.env.HOME || process.cwd(), '.config'), 'vibedeck/session-updates');
+}
+
+function currentContext(cwd) {
+  const worktreeRoot = tryExec('git', ['-C', cwd, 'rev-parse', '--show-toplevel']);
+  if (!worktreeRoot) return { cwd, title: path.basename(cwd) || 'worktree' };
+
+  const branch = tryExec('git', ['-C', worktreeRoot, 'branch', '--show-current']);
+  const shortSha = tryExec('git', ['-C', worktreeRoot, 'rev-parse', '--short=8', 'HEAD']);
+  const remoteRepo = parseRemote(tryExec('git', ['-C', worktreeRoot, 'remote', 'get-url', 'origin']));
+
+  let pr = null;
+  if (remoteRepo && branch) {
+    const rawPr = tryExec(
+      'gh',
+      [
+        'pr',
+        'list',
+        '--repo',
+        remoteRepo,
+        '--head',
+        branch,
+        '--state',
+        'all',
+        '--json',
+        'number,state,isDraft,title,url,headRefName,updatedAt',
+        '--limit',
+        '5',
+      ],
+      worktreeRoot
+    );
+    try {
+      const prs = JSON.parse(rawPr || '[]');
+      pr = prs.find((candidate) => candidate.headRefName === branch) || prs[0] || null;
+    } catch {
+      pr = null;
+    }
+  }
+
+  const title = pr?.title || branch || (shortSha ? `detached ${shortSha}` : path.basename(worktreeRoot));
+  return {
+    cwd: worktreeRoot,
+    title: truncate(title, 48),
+    branch: branch || null,
+    pr: pr
+      ? {
+          number: pr.number,
+          state: pr.state,
+          isDraft: Boolean(pr.isDraft),
+          title: pr.title || '',
+          url: pr.url || '',
+        }
+      : null,
+  };
+}
+
+const argTitle = process.argv.slice(2).join(' ').trim();
+const context = currentContext(process.cwd());
+const title = truncate(argTitle || context.title, 48);
+const update = {
+  slug: process.env.VIBEDECK_SESSION_SLUG || null,
+  source: 'manual',
+  cwd: context.cwd,
+  title,
+  branch: context.branch || null,
+  pr: context.pr || null,
+  updatedAt: new Date().toISOString(),
+};
+
+const updatesDir = process.env.VIBEDECK_UPDATES_DIR || defaultUpdatesDir();
+if (updatesDir) {
+  fs.mkdirSync(updatesDir, { recursive: true });
+  const prefix = update.slug || 'active';
+  const file = path.join(updatesDir, `${prefix}-${Date.now()}.json`);
+  fs.writeFileSync(file, JSON.stringify(update), 'utf8');
+}
+
+const metadata = Buffer.from(JSON.stringify({ source: 'manual', cwd: context.cwd, title }), 'utf8').toString('base64url');
+const terminalTitle = `worktree · ${title} ⟦vd:${metadata}⟧`;
+
+process.stdout.write(`\u001b]0;${terminalTitle}\u0007`);
+process.stdout.write(`VibeDeck context updated: ${title} (${context.cwd})\n`);
+if (context.branch) process.stdout.write(`Branch: ${context.branch}\n`);
+if (context.pr) process.stdout.write(`PR: #${context.pr.number} ${context.pr.isDraft ? 'draft' : String(context.pr.state).toLowerCase()} ${context.pr.url}\n`);
