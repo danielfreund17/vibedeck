@@ -13,6 +13,17 @@ Each session is your login shell running on its own pty, wired straight to the t
 
 VibeDeck remembers your **layout** — scopes, session names, and working directories — and restores it on the next launch, reopening a fresh shell in each session's directory. The shells themselves do **not** survive quitting the app: a process running in a session dies on ⌘Q. If you need something to keep running across a restart, start `tmux` (or `screen`) inside a session yourself.
 
+### Agent session snapshots
+
+VibeDeck snapshots which **pi** / **Claude Code** conversation is running in which tab, so you can bring them all back after a quit or reboot:
+
+- **When:** once a day (checked every 15 min while the app runs), on quit (before the shells are killed), and on demand — ⌘⇧P → **Save Session Snapshot**. Empty snapshots (no agents running) are never written, so a fresh launch can't shadow a good one.
+- **Restore:** on launch VibeDeck offers to restore the latest snapshot; any time later use ⌘⇧P → **Restore Latest Snapshot…** (or **Restore Snapshot…** to pick an older one). Each tab's shell types `cd <dir> && pi --session <id>` / `claude --resume <id>`, starting tabs ~1s apart. Tabs already running an agent are skipped, closed tabs are recreated, and missing worktrees/session files are reported.
+- **Flags:** `--dangerously-skip-permissions`, `--permission-mode`, `--model`, `--agent` (Claude) and `--provider`, `--model`, `--thinking` (pi) carry over; nothing else does (no prompts, no `--api-key`).
+- **How agents are identified:** VibeDeck finds the agent process under each tab's shell. Claude Code's own `~/.claude/sessions/<pid>.json` gives the session id; pi needs the companion extension (`integrations/pi/vibedeck-session-title.ts`), which registers its session in `<userData>/agent-registry/`. pi sessions started before the extension was installed need a `/reload` to be captured.
+- **Storage:** `<userData>/snapshots/*.json` (last 14 daily + last 10 of each other kind).
+- **Snapshot a running VibeDeck from outside** (e.g. before upgrading from a build without on-quit snapshots): `node scripts/snapshot-running.js`.
+
 ## Requirements
 
 - macOS (developed/tested there; Linux likely works with minor tweaks)

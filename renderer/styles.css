@@ -452,6 +452,33 @@ body.resizing .terminals {
 .btn-ghost {
   background: transparent;
 }
+.modal:has(.modal-body) {
+  width: 440px;
+}
+.modal-body {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--fg-dim, #a0a4b0);
+  white-space: pre-wrap;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+/* ---- toast ---- */
+.toast {
+  position: fixed;
+  right: 18px;
+  bottom: 36px;
+  max-width: 460px;
+  padding: 10px 14px;
+  border-radius: 9px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  font-size: 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  z-index: 200;
+}
 
 /* ---- command palette ---- */
 .palette-overlay {

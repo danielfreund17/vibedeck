@@ -26,6 +26,10 @@ let paletteEl = null; // the open command-palette overlay, if any
 
 // sessionId -> { term, fit, ptyId, el }
 const terminals = new Map();
+// sessionId -> in-flight ensureTerminal() promise (never spawn two shells for one tab)
+const terminalStarts = new Map();
+// sessionId -> shell command to run once that tab's shell first starts (snapshot restore)
+const pendingInitialCommands = new Map();
 // ptyId -> sessionId, to route incoming pty data to the right terminal
 const ptyToSession = new Map();
 
@@ -229,6 +233,288 @@ function promptModal(title, defaultValue = '') {
     input.focus();
     input.select();
   });
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+
+// Yes/no modal with a short multi-line body.
+function confirmModal(title, bodyLines, okLabel = 'OK', cancelLabel = 'Cancel') {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal">
+        <div class="modal-title"></div>
+        <div class="modal-body"></div>
+        <div class="modal-actions">
+          <button class="btn btn-ghost" data-act="cancel"></button>
+          <button class="btn btn-primary" data-act="ok"></button>
+        </div>
+      </div>`;
+    overlay.querySelector('.modal-title').textContent = title;
+    overlay.querySelector('.modal-body').innerHTML = bodyLines.map((line) => `<div>${escapeHtml(line)}</div>`).join('');
+    const ok = overlay.querySelector('[data-act=ok]');
+    const cancel = overlay.querySelector('[data-act=cancel]');
+    ok.textContent = okLabel;
+    cancel.textContent = cancelLabel;
+
+    const close = (val) => {
+      document.removeEventListener('keydown', onKey, true);
+      overlay.remove();
+      resolve(val);
+    };
+    function onKey(e) {
+      e.stopPropagation(); // keep keys away from the terminal behind the modal
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        close(true);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        close(false);
+      }
+    }
+    overlay.addEventListener('mousedown', (e) => {
+      if (e.target === overlay) close(false);
+    });
+    cancel.onclick = () => close(false);
+    ok.onclick = () => close(true);
+    document.addEventListener('keydown', onKey, true);
+    document.body.appendChild(overlay);
+    ok.focus();
+  });
+}
+
+// Pick one row from a list (arrows + enter, or click). Resolves the row's value or null.
+function listPickerModal(placeholder, rows) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay palette-overlay';
+    overlay.innerHTML = `<div class="palette"><input class="palette-input" type="text" readonly /><div class="palette-list"></div></div>`;
+    const input = overlay.querySelector('.palette-input');
+    const listEl = overlay.querySelector('.palette-list');
+    input.placeholder = placeholder;
+    let sel = 0;
+
+    const close = (val) => {
+      document.removeEventListener('keydown', onKey, true);
+      overlay.remove();
+      resolve(val);
+    };
+    const highlight = () => [...listEl.children].forEach((c, i) => c.classList.toggle('active', i === sel));
+    rows.forEach((row, i) => {
+      const item = document.createElement('div');
+      item.className = 'palette-item' + (i === 0 ? ' active' : '');
+      const label = document.createElement('span');
+      label.className = 'pi-name';
+      label.textContent = row.label;
+      const detail = document.createElement('span');
+      detail.className = 'pi-path';
+      detail.textContent = row.detail || '';
+      item.append(label, detail);
+      item.onmouseenter = () => {
+        sel = i;
+        highlight();
+      };
+      item.onclick = () => close(row.value);
+      listEl.appendChild(item);
+    });
+    if (!rows.length) {
+      const empty = document.createElement('div');
+      empty.className = 'palette-empty';
+      empty.textContent = 'Nothing here yet.';
+      listEl.appendChild(empty);
+    }
+    function onKey(e) {
+      e.stopPropagation();
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        close(null);
+      } else if (e.key === 'ArrowDown' && rows.length) {
+        e.preventDefault();
+        sel = (sel + 1) % rows.length;
+        highlight();
+      } else if (e.key === 'ArrowUp' && rows.length) {
+        e.preventDefault();
+        sel = (sel - 1 + rows.length) % rows.length;
+        highlight();
+      } else if (e.key === 'Enter' && rows[sel]) {
+        e.preventDefault();
+        close(rows[sel].value);
+      }
+    }
+    overlay.addEventListener('mousedown', (e) => {
+      if (e.target === overlay) close(null);
+    });
+    document.addEventListener('keydown', onKey, true);
+    document.body.appendChild(overlay);
+    input.focus();
+  });
+}
+
+// Transient bottom-right notice.
+function toast(text, ms = 4000) {
+  const node = document.createElement('div');
+  node.className = 'toast';
+  node.textContent = text;
+  document.body.appendChild(node);
+  setTimeout(() => node.remove(), ms);
+}
+
+// ---------- snapshots ----------
+// A snapshot records which pi / Claude conversation runs in which tab (taken
+// daily, on quit, and on demand by the main process). Restoring re-opens each
+// tab's shell and types `cd <dir> && pi --session <id>` / `claude --resume <id>`.
+
+const RESTORE_STAGGER_MS = 800; // don't boot two dozen Node agents at once
+
+function formatSnapshotTime(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return String(iso);
+  return date.toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
+
+function pluralize(n, word) {
+  return `${n} ${word}${n === 1 ? '' : 's'}`;
+}
+
+async function saveSnapshotNow() {
+  const result = await api.saveSnapshot();
+  if (result?.error) toast(`Snapshot failed: ${result.error}`, 6000);
+  else if (!result?.saved) toast('Nothing to snapshot — no running pi / Claude sessions found.');
+  else {
+    const missed = result.unidentified
+      ? ` · ${pluralize(result.unidentified, 'agent')} not captured (run /reload in older pi sessions)`
+      : '';
+    toast(`Snapshot saved: ${pluralize(result.agentCount, 'agent session')}${missed}`, missed ? 7000 : 4000);
+  }
+}
+
+function restoreSummaryLines(plan) {
+  const resume = plan.items.filter((i) => i.action === 'resume');
+  const skipped = plan.items.filter((i) => i.action === 'skip');
+  const byKind = (kind) => resume.filter((i) => i.kind === kind).length;
+  const lines = [
+    `Snapshot: ${formatSnapshotTime(plan.takenAt)} (${plan.trigger})`,
+    `Resume ${pluralize(resume.length, 'session')}: ${byKind('pi')} pi · ${byKind('claude')} Claude`,
+  ];
+  if (skipped.length) {
+    lines.push(`Skip ${skipped.length}:`);
+    for (const item of skipped.slice(0, 8)) lines.push(`  • ${item.name} — ${item.reason}`);
+    if (skipped.length > 8) lines.push(`  • …and ${skipped.length - 8} more`);
+  }
+  return lines;
+}
+
+// Make sure every tab being resumed exists (re-creating closed tabs/scopes from
+// the snapshot) and queue its resume command. Returns [{ repo, session, command }].
+function mergeSnapshotLayout(plan) {
+  const commands = new Map(plan.items.filter((i) => i.action === 'resume').map((i) => [i.sessionId, i.command]));
+  const targets = [];
+  for (const snapRepo of plan.snapshot.repos || []) {
+    const snapSessions = (snapRepo.sessions || []).filter((s) => commands.has(s.id));
+    if (!snapSessions.length) continue;
+    let repo = state.repos.find((r) => r.id === snapRepo.id) || state.repos.find((r) => r.cwd === snapRepo.cwd);
+    if (!repo) {
+      repo = { id: snapRepo.id, name: snapRepo.name, cwd: snapRepo.cwd, sessions: [] };
+      state.repos.push(repo);
+    }
+    for (const snapSession of snapSessions) {
+      let found = findSession(snapSession.id);
+      if (!found) {
+        const slugTaken = Boolean(findSessionBySlug(snapSession.slug));
+        const session = {
+          id: snapSession.id,
+          name: snapSession.name,
+          nameSource: snapSession.nameSource || 'default',
+          cwd: snapSession.cwd || repo.cwd,
+          cwdSource: (snapSession.cwd || repo.cwd) === repo.cwd ? 'default' : 'agent',
+          worktreeLocked: false,
+          slug: slugTaken ? newSlug() : snapSession.slug,
+          pinned: snapSession.nameSource === 'manual',
+        };
+        repo.sessions.push(session);
+        found = { repo, session };
+      }
+      targets.push({ ...found, command: commands.get(snapSession.id) });
+    }
+  }
+  return targets;
+}
+
+async function restoreSnapshot(name, { confirmFirst = true, launchOffer = false } = {}) {
+  const plan = await api.planSnapshotRestore(name);
+  if (!plan) {
+    toast('Snapshot could not be read.');
+    return;
+  }
+  const resumeCount = plan.items.filter((i) => i.action === 'resume').length;
+  if (!resumeCount) {
+    if (!launchOffer) toast('Nothing to restore — every agent in that snapshot is already running or unavailable.', 6000);
+    return;
+  }
+  if (confirmFirst) {
+    const title = launchOffer
+      ? `Restore ${pluralize(resumeCount, 'agent session')} from your last snapshot?`
+      : `Restore ${pluralize(resumeCount, 'agent session')}?`;
+    const ok = await confirmModal(title, restoreSummaryLines(plan), 'Restore', launchOffer ? 'Not now' : 'Cancel');
+    if (!ok) return;
+  }
+
+  const targets = mergeSnapshotLayout(plan);
+  normalizeStateShape();
+  if (!state.activeRepoId && state.repos.length) state.activeRepoId = state.repos[0].id;
+  for (const repo of state.repos) {
+    if (!state.activeSessionByRepo[repo.id] && repo.sessions.length) state.activeSessionByRepo[repo.id] = repo.sessions[0].id;
+  }
+  // Queue first: if the user opens a tab before the stagger reaches it, its
+  // shell starts with the command anyway (ensureTerminal consumes the queue).
+  const live = [];
+  for (const target of targets) {
+    if (terminals.has(target.session.id)) live.push(target);
+    else pendingInitialCommands.set(target.session.id, target.command);
+  }
+  await persist();
+  render(); // mounts (and so resumes) the active tab first
+
+  // Tabs whose shell is already open (and idle — no agent, per the plan): type it in.
+  for (const target of live) {
+    const entry = terminals.get(target.session.id);
+    if (entry) api.writeSession(entry.ptyId, `${target.command}\r`);
+  }
+  let started = live.length;
+  for (const target of targets) {
+    if (!pendingInitialCommands.has(target.session.id)) continue; // already started
+    await ensureTerminal(target.repo, target.session, { background: true });
+    started++;
+    await new Promise((r) => setTimeout(r, RESTORE_STAGGER_MS));
+  }
+  mountActive();
+  toast(`Restored ${pluralize(started, 'agent session')}.`);
+}
+
+async function restoreLatestSnapshot(options = {}) {
+  const snapshots = await api.listSnapshots();
+  const latest = snapshots.find((s) => s.agentCount > 0);
+  if (!latest) {
+    if (!options.launchOffer) toast('No snapshots yet — use "Save Session Snapshot" or wait for the daily one.', 6000);
+    return;
+  }
+  await restoreSnapshot(latest.name, options);
+}
+
+async function pickAndRestoreSnapshot() {
+  const snapshots = await api.listSnapshots();
+  const name = await listPickerModal(
+    'Pick a snapshot to restore  (⏎ restore · esc close)',
+    snapshots.map((s) => ({
+      value: s.name,
+      label: formatSnapshotTime(s.takenAt),
+      detail: `${s.trigger} · ${pluralize(s.agentCount, 'agent')}`,
+    }))
+  );
+  if (name) await restoreSnapshot(name);
 }
 
 // ---------- mutations ----------
@@ -556,6 +842,27 @@ function contextTitle(ctx) {
 
 function commandItems() {
   return [
+    {
+      label: 'Save Session Snapshot',
+      detail: 'Record which pi / Claude session runs in every tab (also taken daily and on quit)',
+      keywords: 'snapshot save backup sessions agents pi claude',
+      enabled: true,
+      run: () => saveSnapshotNow(),
+    },
+    {
+      label: 'Restore Latest Snapshot…',
+      detail: 'Re-open every pi / Claude session from the newest snapshot in its tab',
+      keywords: 'snapshot restore reload resume sessions agents pi claude latest',
+      enabled: true,
+      run: () => restoreLatestSnapshot(),
+    },
+    {
+      label: 'Restore Snapshot…',
+      detail: 'Pick an older snapshot to restore',
+      keywords: 'snapshot restore reload resume history older pick',
+      enabled: true,
+      run: () => pickAndRestoreSnapshot(),
+    },
     {
       label: 'Set Worktree for Active Session…',
       detail: 'Choose a git worktree and assign it to the selected vertical tab',
@@ -1038,13 +1345,24 @@ function openTerminalLink(event, uri) {
 }
 
 // ---------- terminal lifecycle ----------
-async function ensureTerminal(repo, session) {
+function ensureTerminal(repo, session, options = {}) {
   const existing = terminals.get(session.id);
-  if (existing) return existing;
+  if (existing) return Promise.resolve(existing);
+  if (!terminalStarts.has(session.id)) {
+    const start = startTerminal(repo, session, options).finally(() => terminalStarts.delete(session.id));
+    terminalStarts.set(session.id, start);
+  }
+  return terminalStarts.get(session.id);
+}
+
+async function startTerminal(repo, session, { background = false } = {}) {
+  const initialCommand = pendingInitialCommands.get(session.id) || null;
+  pendingInitialCommands.delete(session.id);
 
   const wrap = document.createElement('div');
   wrap.className = 'term';
-  wrap.style.display = 'block'; // active session is about to be shown
+  // Active session is about to be shown; background starts (restore) stay hidden.
+  wrap.style.display = background ? 'none' : 'block';
   el.terminals.appendChild(wrap);
 
   const term = new Terminal({
@@ -1069,6 +1387,7 @@ async function ensureTerminal(repo, session) {
     cwd: session.cwd || repo.cwd,
     cols: term.cols,
     rows: term.rows,
+    initialCommand,
   });
 
   const entry = {
@@ -1533,7 +1852,9 @@ async function init() {
   api.onMenu(async (action) => {
     if (paletteEl && action !== 'palette' && action !== 'command-palette') return;
     const repo = activeRepo();
-    if (action === 'palette') openPalette();
+    if (action === 'snapshot-save') saveSnapshotNow();
+    else if (action === 'snapshot-restore-latest') restoreLatestSnapshot();
+    else if (action === 'palette') openPalette();
     else if (action === 'command-palette') openCommandPalette();
     else if (action === 'new-session') {
       if (repo) addSession(repo.id);
@@ -1591,6 +1912,8 @@ async function init() {
   applySidebarWidth();
   initResizer();
   render();
+  // Nothing runs in a fresh launch — offer to bring the last snapshot back.
+  restoreLatestSnapshot({ launchOffer: true }).catch(() => {});
 }
 
 init();

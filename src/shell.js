@@ -43,7 +43,7 @@ function resolveShell() {
   return '/bin/sh';
 }
 
-function shellEnv({ slug, updatesDir }) {
+function shellEnv({ slug, updatesDir, agentsDir }) {
   const env = { ...process.env };
   // A GUI-launched app doesn't inherit the shell PATH; guarantee the common
   // bin dirs so tools (git, brew-installed binaries, agents) resolve.
@@ -51,6 +51,7 @@ function shellEnv({ slug, updatesDir }) {
   env.PATH = [...new Set([...extra, ...(env.PATH ? env.PATH.split(':') : [])])].join(':');
   env.VIBEDECK_SESSION_SLUG = slug;
   if (updatesDir) env.VIBEDECK_UPDATES_DIR = updatesDir;
+  if (agentsDir) env.VIBEDECK_AGENTS_DIR = agentsDir; // pi extension registers its session here
   // Let programs (e.g. Claude Code) own the terminal title so VibeDeck can
   // auto-name sessions; suppress oh-my-zsh's idle title churn for our shells.
   env.DISABLE_AUTO_TITLE = 'true';
@@ -71,7 +72,7 @@ function shellEnv({ slug, updatesDir }) {
 // Spawn a login shell in `cwd`. Returns the pty, whether this created the
 // session (always true — nothing is reattached), and the resolved start dir so
 // the caller can settle the shell into the repo dir (see main.js).
-function spawnSession({ slug, cwd, cols, rows, updatesDir }) {
+function spawnSession({ slug, cwd, cols, rows, updatesDir, agentsDir }) {
   if (!isValidSlug(slug)) throw new Error(`invalid session slug: ${slug}`);
   const startDir = cwd && dirExists(cwd) ? cwd : os.homedir();
   const proc = pty.spawn(resolveShell(), ['-l'], {
@@ -79,7 +80,7 @@ function spawnSession({ slug, cwd, cols, rows, updatesDir }) {
     cols: cols || 80,
     rows: rows || 24,
     cwd: startDir,
-    env: shellEnv({ slug, updatesDir }),
+    env: shellEnv({ slug, updatesDir, agentsDir }),
   });
   return { proc, isNew: true, startDir };
 }

@@ -8,7 +8,7 @@
  */
 
 import { Buffer } from 'node:buffer';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
@@ -85,6 +85,40 @@ function writeVibeDeckUpdate(cwd: string, title: string): void {
   );
 }
 
+// Register this pi process's open conversation so VibeDeck snapshots can
+// re-launch it later (`pi --session <id>`). Only inside a VibeDeck tab.
+function registryFile(): string | null {
+  if (!process.env.VIBEDECK_SESSION_SLUG) return null;
+  const dir = process.env.VIBEDECK_AGENTS_DIR || join(homedir(), 'Library/Application Support/vibedeck/agent-registry');
+  return join(dir, `pi-${process.pid}.json`);
+}
+
+function registerSession(ctx: ExtensionContext): void {
+  const file = registryFile();
+  if (!file) return;
+  try {
+    mkdirSync(join(file, '..'), { recursive: true });
+    const entry = {
+      pid: process.pid,
+      slug: process.env.VIBEDECK_SESSION_SLUG,
+      sessionId: ctx.sessionManager.getSessionId(),
+      sessionFile: ctx.sessionManager.getSessionFile() ?? null,
+      cwd: ctx.cwd,
+      argv: process.argv.slice(2),
+      updatedAt: new Date().toISOString(),
+    };
+    writeFileSync(`${file}.tmp`, JSON.stringify(entry), 'utf8');
+    renameSync(`${file}.tmp`, file);
+  } catch {
+    // Best effort: a missed registration only means this tab isn't snapshotted.
+  }
+}
+
+function unregisterSession(): void {
+  const file = registryFile();
+  if (file) rmSync(file, { force: true });
+}
+
 function emitVibeDeckTitle(ctx: ExtensionContext, title: string, options: { writeUpdate?: boolean } = {}): void {
   if (options.writeUpdate) writeVibeDeckUpdate(ctx.cwd, title);
   const metadata = encodeMetadata({ source: 'pi', cwd: ctx.cwd, title });
@@ -104,7 +138,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on('session_start', async (_event, ctx) => {
+    registerSession(ctx);
     emitVibeDeckTitle(ctx, pi.getSessionName() || fallbackTitle(ctx));
+  });
+
+  pi.on('session_shutdown', async (event) => {
+    // reload/new/resume/fork are followed by session_start, which re-registers.
+    if (event.reason === 'quit') unregisterSession();
   });
 
   pi.on('session_info_changed', async (event, ctx) => {
@@ -112,6 +152,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on('before_agent_start', async (event, ctx) => {
+    registerSession(ctx); // cheap; keeps the registry right after /resume, /new, /fork
     if (generated) {
       emitVibeDeckTitle(ctx, pi.getSessionName() || fallbackTitle(ctx));
       return;

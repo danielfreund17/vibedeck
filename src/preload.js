@@ -17,6 +17,10 @@ contextBridge.exposeInMainWorld('api', {
   clipReadImage: () => ipcRenderer.invoke('clipboard:readImage'),
   openExternalUrl: (url) => ipcRenderer.invoke('shell:openExternalUrl', url),
 
+  saveSnapshot: () => ipcRenderer.invoke('snapshot:save'),
+  listSnapshots: () => ipcRenderer.invoke('snapshot:list'),
+  planSnapshotRestore: (name) => ipcRenderer.invoke('snapshot:plan', name),
+
   startSession: (opts) => ipcRenderer.invoke('session:start', opts),
   killSession: (slug, ptyId) => ipcRenderer.invoke('session:kill', { slug, ptyId }),
   writeSession: (ptyId, data) => ipcRenderer.send('session:write', { ptyId, data }),

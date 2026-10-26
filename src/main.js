@@ -8,9 +8,12 @@ const os = require('os');
 const fs = require('fs');
 const state = require('./state');
 const shell = require('./shell');
+const snap = require('./snapshot');
+const store = require('./snapshot-store');
 
 // Keep dev (`npm start`) and the packaged .app pointed at the same state/config.
-app.setPath('userData', path.join(app.getPath('appData'), 'vibedeck'));
+// VIBEDECK_USER_DATA points a dev/test run at a throwaway state dir instead.
+app.setPath('userData', process.env.VIBEDECK_USER_DATA || path.join(app.getPath('appData'), 'vibedeck'));
 
 let mainWindow = null;
 
@@ -26,6 +29,41 @@ function userDataDir() {
 
 function sessionUpdatesDir() {
   return path.join(userDataDir(), 'session-updates');
+}
+
+function agentRegistryDir() {
+  return store.agentRegistryDir(userDataDir());
+}
+
+// ---- session snapshots (which agent conversation runs in which tab) ----
+
+const DAILY_CHECK_INTERVAL_MS = 15 * 60 * 1000;
+let dailySnapshotTimer = null;
+let quitSnapshotTaken = false;
+
+// [{ slug, pid }] for every tab whose shell is alive in this app run.
+function liveShells() {
+  return [...ptys.values()].map(({ slug, proc }) => ({ slug, pid: proc.pid })).filter((s) => s.pid);
+}
+
+function safeTakeSnapshot(trigger) {
+  try {
+    return store.takeSnapshot(userDataDir(), liveShells(), trigger);
+  } catch (error) {
+    console.error(`[vibedeck] ${trigger} snapshot failed:`, error);
+    return { saved: false, trigger, error: String(error?.message || error) };
+  }
+}
+
+// Once per local calendar day. Retries every interval until a day's snapshot
+// lands (e.g. when nothing was running yet at the first check).
+function maybeTakeDailySnapshot() {
+  if (!snap.hasDailyFor(store.listSnapshotNames(userDataDir()))) safeTakeSnapshot('daily');
+}
+
+function startDailySnapshots() {
+  setTimeout(maybeTakeDailySnapshot, 2 * 60 * 1000); // let restored agents start first
+  dailySnapshotTimer = setInterval(maybeTakeDailySnapshot, DAILY_CHECK_INTERVAL_MS);
 }
 
 // Scan registered parent folders one level deep for git repositories.
@@ -404,7 +442,7 @@ function shellIntegrationScript() {
 // After a session's shell settles at its first prompt (output goes quiet), cd it
 // into the repo. `builtin cd` bypasses shell `cd` wrappers (e.g. RVM's), and
 // waiting for quiet avoids racing shell startup.
-function scheduleInitialCd(proc, dir) {
+function scheduleInitialCd(proc, dir, initialCommand) {
   const quoted = `'${String(dir).replace(/'/g, `'\\''`)}'`;
   let timer = null;
   let done = false;
@@ -414,7 +452,8 @@ function scheduleInitialCd(proc, dir) {
     timer = setTimeout(() => {
       done = true;
       try {
-        proc.write(`${shellIntegrationScript()}\rbuiltin cd -- ${quoted} && clear\r`);
+        const then = initialCommand ? ` && ${initialCommand}` : '';
+        proc.write(`${shellIntegrationScript()}\rbuiltin cd -- ${quoted} && clear${then}\r`);
       } catch {
         /* pty gone */
       }
@@ -459,6 +498,9 @@ function buildMenu() {
         item('New Session', 'Cmd+T', 'new-session'),
         item('Close Active Session', 'Cmd+W', 'close-session'),
         { type: 'separator' },
+        item('Save Session Snapshot', undefined, 'snapshot-save'),
+        item('Restore Latest Snapshot…', undefined, 'snapshot-restore-latest'),
+        { type: 'separator' },
         item('Previous Scope', 'Cmd+Shift+[', 'prev-scope'),
         item('Next Scope', 'Cmd+Shift+]', 'next-scope'),
         item('Previous Session', "Cmd+Shift+'", 'prev-session'),
@@ -485,6 +527,7 @@ app.whenReady().then(() => {
   createWindow();
   buildMenu();
   startSessionUpdateWatcher();
+  startDailySnapshots();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -496,6 +539,12 @@ app.on('window-all-closed', () => {
 
 // Kill every session's shell on quit — nothing persists past the app.
 app.on('before-quit', () => {
+  // Snapshot before the shells (and their agents) are killed below.
+  if (!quitSnapshotTaken) {
+    quitSnapshotTaken = true;
+    safeTakeSnapshot('quit');
+  }
+  if (dailySnapshotTimer) clearInterval(dailySnapshotTimer);
   try {
     sessionUpdateWatcher?.close();
   } catch {
@@ -626,8 +675,20 @@ ipcMain.handle('session:resolveContext', (_e, cwd) => resolveSessionContext(cwd)
 ipcMain.handle('session:listWorktrees', (_e, repoCwd) => listWorktreeContexts(repoCwd));
 
 // ---- sessions ----
-ipcMain.handle('session:start', (_e, { slug, cwd, cols, rows }) => {
-  const { proc, isNew, startDir } = shell.spawnSession({ slug, cwd, cols, rows, updatesDir: sessionUpdatesDir() });
+// ---- snapshots ----
+ipcMain.handle('snapshot:save', () => safeTakeSnapshot('manual'));
+ipcMain.handle('snapshot:list', () => store.snapshotSummaries(userDataDir()));
+ipcMain.handle('snapshot:plan', (_e, name) => store.planSnapshotRestore(userDataDir(), liveShells(), name));
+
+ipcMain.handle('session:start', (_e, { slug, cwd, cols, rows, initialCommand }) => {
+  const { proc, isNew, startDir } = shell.spawnSession({
+    slug,
+    cwd,
+    cols,
+    rows,
+    updatesDir: sessionUpdatesDir(),
+    agentsDir: agentRegistryDir(),
+  });
   const ptyId = crypto.randomUUID();
   ptys.set(ptyId, { proc, slug });
 
@@ -645,7 +706,8 @@ ipcMain.handle('session:start', (_e, { slug, cwd, cols, rows }) => {
 
   // Some shells cd on startup (RVM/oh-my-zsh here), overriding the pty's cwd.
   // Once the shell settles at its first prompt, cd into the repo.
-  if (isNew) scheduleInitialCd(proc, startDir);
+  // initialCommand (snapshot restore) runs right after that cd.
+  if (isNew) scheduleInitialCd(proc, startDir, typeof initialCommand === 'string' ? initialCommand : null);
 
   return { ptyId };
 });

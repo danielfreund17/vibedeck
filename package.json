@@ -13,7 +13,8 @@
     "icon": "bash scripts/build-icon.sh",
     "dist": "npm run vendor && electron-builder --mac --arm64",
     "install-app": "npm run dist && bash scripts/install-app.sh",
-    "postinstall": "electron-rebuild -f -w node-pty && node scripts/copy-vendor.js"
+    "postinstall": "electron-rebuild -f -w node-pty && node scripts/copy-vendor.js",
+    "test": "node --test \"test/*.test.js\""
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.10.0",
