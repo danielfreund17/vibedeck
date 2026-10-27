@@ -112,14 +112,6 @@ function execText(command, args, options = {}) {
   });
 }
 
-async function tryExecText(command, args, options) {
-  try {
-    return await execText(command, args, options);
-  } catch {
-    return null;
-  }
-}
-
 async function git(cwd, args) {
   return execText('git', ['-C', cwd, ...args], { timeout: 5000 });
 }
