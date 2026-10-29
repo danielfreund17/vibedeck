@@ -91,6 +91,12 @@ test('buildSnapshot should attach agents by slug and count them', () => {
   assert.equal(snapshot.repos[0].sessions[1].cwd, '/repo/cxllm'); // falls back to repo cwd
 });
 
+test('buildSnapshot should carry tab tags (empty list when none)', () => {
+  const state = { repos: [{ id: 'r', name: 'r', cwd: '/r', sessions: [{ id: 'a', slug: 'tg_a', name: 'a', tags: ['needs QA'] }, { id: 'b', slug: 'tg_b', name: 'b' }] }] };
+  const snapshot = snap.buildSnapshot({ state, agentsBySlug: {}, trigger: 'manual' });
+  assert.deepEqual(snapshot.repos[0].sessions.map((s) => s.tags), [['needs QA'], []]);
+});
+
 test('snapshot file names should round-trip and sort newest first', () => {
   const name = snap.snapshotFileName(new Date('2026-10-26T14:03:05.123Z'), 'daily');
   assert.equal(name, '2026-10-26T14-03-05-123Z-daily.json');
