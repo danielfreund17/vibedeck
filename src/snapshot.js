@@ -138,6 +138,7 @@ function buildSnapshot({ state, agentsBySlug, trigger, now = new Date() }) {
         slug: session.slug,
         name: session.name,
         nameSource: session.nameSource,
+        tags: Array.isArray(session.tags) ? session.tags : [],
         cwd: session.cwd || repo.cwd,
         agent: agent
           ? {

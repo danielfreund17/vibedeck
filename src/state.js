@@ -32,6 +32,8 @@ function loadState(userDataDir) {
       activeSessionByRepo: parsed.activeSessionByRepo ?? {},
       sidebarWidth: parsed.sidebarWidth ?? 210,
       parentFolders: Array.isArray(parsed.parentFolders) ? parsed.parentFolders : [],
+      // Tag list; omitted when absent so the renderer seeds the default tags.
+      ...(Array.isArray(parsed.tags) ? { tags: parsed.tags } : {}),
     };
   } catch {
     return defaultState();

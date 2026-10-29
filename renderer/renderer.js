@@ -2,6 +2,20 @@
 
 /* globals Terminal, FitAddon, WebLinksAddon */
 
+import {
+  ensureTag,
+  hasTag,
+  normalizeSessionTags,
+  normalizeTagLibrary,
+  sortByLibrary,
+  tagColor,
+  tagKey,
+  tagPickerRows,
+  tagUsageCount,
+  withTag,
+  withoutTag,
+} from './tags.js';
+
 // VibeDeck renderer. Owns the scope -> session model, renders the two-axis UI,
 // and lazily attaches an xterm <-> pty <-> shell pipe per session on demand.
 
@@ -13,7 +27,9 @@ let state = {
   activeSessionByRepo: {},
   sidebarWidth: 210,
   parentFolders: [],
+  tags: [],
 };
+let tagFilter = null; // show only tabs carrying this tag (not persisted)
 let liveSlugs = new Set(); // sessions with a shell open right now (none, at launch)
 const busySessionIds = new Set(); // sessions that emitted output recently
 const busyTimers = new Map(); // sessionId -> timer that settles the activity dot
@@ -140,6 +156,7 @@ function activeEntry() {
 }
 
 function normalizeStateShape() {
+  state.tags = normalizeTagLibrary(state.tags);
   for (const repo of state.repos || []) {
     if (!Array.isArray(repo.sessions)) repo.sessions = [];
     for (const session of repo.sessions) {
@@ -148,6 +165,7 @@ function normalizeStateShape() {
       if (session.worktreeLocked !== true) session.worktreeLocked = session.cwdSource === 'manual';
       if (!session.nameSource) session.nameSource = session.pinned ? 'manual' : 'default';
       session.pinned = session.nameSource === 'manual'; // keep old state readers compatible
+      session.tags = normalizeSessionTags(session.tags, state.tags);
     }
   }
 }
@@ -433,6 +451,7 @@ function mergeSnapshotLayout(plan) {
           worktreeLocked: false,
           slug: slugTaken ? newSlug() : snapSession.slug,
           pinned: snapSession.nameSource === 'manual',
+          tags: normalizeSessionTags(snapSession.tags, state.tags),
         };
         repo.sessions.push(session);
         found = { repo, session };
@@ -644,6 +663,15 @@ function fuzzyScore(name, q) {
   return qi === q.length ? 200 - name.length : -Infinity;
 }
 
+// A direct hit in a command's label (prefix or substring) outranks keyword
+// matches; otherwise a keyword prefix on a short keyword list would beat the
+// command you actually named (typing "tag" listed Delete Tag above Add Tag).
+function scoreCommand(command, q) {
+  const label = fuzzyScore(command.label.toLowerCase(), q);
+  if (label >= 400) return label + 1000;
+  return Math.max(label, fuzzyScore(command.keywords, q) - 100);
+}
+
 // Command palette (⌘P / the + button): search git repos under registered
 // parent folders and open one as a scope tab.
 let paletteRepos = [];
@@ -687,7 +715,7 @@ async function openPalette() {
           .map((command) => ({
             type: 'command',
             command,
-            score: Math.max(fuzzyScore(command.label.toLowerCase(), q), fuzzyScore(command.keywords, q) - 100),
+            score: scoreCommand(command, q),
           }))
           .filter((item) => item.score > -Infinity)
           .sort((a, b) => b.score - a.score);
@@ -854,6 +882,34 @@ function commandItems() {
       run: () => renameActiveSession(),
     },
     {
+      label: 'Add Tag…',
+      detail: 'Tag the selected tab (needs QA, blocked, …) or create a new tag',
+      keywords: 'tag label status add needs review qa monitoring blocked done exploration progress',
+      enabled: Boolean(activeSessionRecord()),
+      run: () => addTagToActiveSession(),
+    },
+    {
+      label: 'Remove Tag…',
+      detail: 'Remove a tag from the selected tab',
+      keywords: 'tag label status remove untag clear',
+      enabled: Boolean(activeSessionRecord()?.session.tags?.length),
+      run: () => removeTagFromActiveSession(),
+    },
+    {
+      label: tagFilter ? `Filter Tabs by Tag… (now: ${tagFilter})` : 'Filter Tabs by Tag…',
+      detail: 'Show only tabs with a given tag in the sidebar',
+      keywords: 'tag filter show only find status',
+      enabled: state.tags.length > 0,
+      run: () => pickTagFilter(),
+    },
+    {
+      label: 'Delete Tag from List…',
+      detail: 'Remove a tag from the tag list (and from every tab that has it)',
+      keywords: 'tag delete list manage remove',
+      enabled: state.tags.length > 0,
+      run: () => deleteTagFromList(),
+    },
+    {
       label: 'Save Session Snapshot',
       detail: 'Record which pi / Claude session runs in every tab (also taken daily and on quit)',
       keywords: 'snapshot save backup sessions agents pi claude',
@@ -907,10 +963,6 @@ function openCommandPalette() {
   const listEl = overlay.querySelector('.palette-list');
   let items = [];
   let sel = 0;
-
-  function scoreCommand(command, q) {
-    return Math.max(fuzzyScore(command.label.toLowerCase(), q), fuzzyScore(command.keywords, q) - 100);
-  }
 
   function computeItems() {
     const q = input.value.trim().toLowerCase();
@@ -1278,12 +1330,13 @@ async function selectSession(repoId, sessionId) {
 // Move up (-1) / down (+1) the active scope's session list, wrapping around.
 function cycleSession(dir) {
   const repo = activeRepo();
-  if (!repo || repo.sessions.length === 0) return;
-  let idx = repo.sessions.findIndex((s) => s.id === activeSessionId(repo.id));
-  if (idx === -1) idx = 0;
-  const n = repo.sessions.length;
+  const sessions = repo ? visibleSessions(repo) : [];
+  if (!sessions.length) return;
+  let idx = sessions.findIndex((s) => s.id === activeSessionId(repo.id));
+  if (idx === -1) idx = dir > 0 ? -1 : 0;
+  const n = sessions.length;
   const nextIdx = (idx + dir + n) % n;
-  selectSession(repo.id, repo.sessions[nextIdx].id);
+  selectSession(repo.id, sessions[nextIdx].id);
 }
 
 function updateSessionActivityDot(sessionId) {
@@ -1467,6 +1520,195 @@ function renameActiveSession() {
   if (active) renameSession(active.repo.id, active.session.id);
 }
 
+// ---------- tags ----------
+function visibleSessions(repo) {
+  return tagFilter ? repo.sessions.filter((s) => hasTag(s.tags, tagFilter)) : repo.sessions;
+}
+
+function tagDot(color) {
+  const dot = document.createElement('span');
+  dot.className = 'tag-dot';
+  dot.style.setProperty('--tag-color', color);
+  return dot;
+}
+
+// Searchable tag picker: existing tags from the list plus a "create" row for
+// whatever was typed. Resolves to { name, create } or null.
+function tagPickerModal(currentTags) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay palette-overlay';
+    overlay.innerHTML = `<div class="palette"><input class="palette-input" type="text" spellcheck="false" placeholder="Add tag — type to search or create  (⏎ add · esc close)" /><div class="palette-list"></div></div>`;
+    const input = overlay.querySelector('.palette-input');
+    const listEl = overlay.querySelector('.palette-list');
+    let rows = [];
+    let sel = 0;
+
+    const close = (val) => {
+      document.removeEventListener('keydown', onKey, true);
+      overlay.remove();
+      resolve(val);
+    };
+    const highlight = () => {
+      [...listEl.children].forEach((c, i) => c.classList.toggle('active', i === sel));
+      listEl.children[sel]?.scrollIntoView({ block: 'nearest' });
+    };
+    const pick = (row) => close({ name: row.name, create: row.kind === 'create' });
+    function renderRows() {
+      rows = tagPickerRows(state.tags, input.value, currentTags);
+      sel = Math.min(sel, Math.max(0, rows.length - 1));
+      listEl.innerHTML = '';
+      if (!rows.length) {
+        const empty = document.createElement('div');
+        empty.className = 'palette-empty';
+        empty.textContent = 'This tab already has every tag. Type a name to create a new one.';
+        listEl.appendChild(empty);
+        return;
+      }
+      rows.forEach((row, i) => {
+        const item = document.createElement('div');
+        item.className = 'palette-item' + (i === sel ? ' active' : '');
+        const label = document.createElement('span');
+        label.className = 'pi-name';
+        label.textContent = row.kind === 'create' ? `Create tag “${row.name}”` : row.name;
+        const detail = document.createElement('span');
+        detail.className = 'pi-path';
+        detail.textContent = row.kind === 'create' ? 'adds it to the tag list' : pluralize(tagUsageCount(state.repos, row.name), 'tab');
+        item.append(tagDot(row.color), label, detail);
+        item.onmouseenter = () => {
+          sel = i;
+          highlight();
+        };
+        item.onclick = () => pick(row);
+        listEl.appendChild(item);
+      });
+    }
+    function onKey(e) {
+      e.stopPropagation();
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        close(null);
+      } else if (e.key === 'ArrowDown' && rows.length) {
+        e.preventDefault();
+        sel = (sel + 1) % rows.length;
+        highlight();
+      } else if (e.key === 'ArrowUp' && rows.length) {
+        e.preventDefault();
+        sel = (sel - 1 + rows.length) % rows.length;
+        highlight();
+      } else if (e.key === 'Enter' && rows[sel]) {
+        e.preventDefault();
+        pick(rows[sel]);
+      }
+    }
+    input.addEventListener('input', () => {
+      sel = 0;
+      renderRows();
+    });
+    overlay.addEventListener('mousedown', (e) => {
+      if (e.target === overlay) close(null);
+    });
+    document.addEventListener('keydown', onKey, true);
+    document.body.appendChild(overlay);
+    renderRows();
+    input.focus();
+  });
+}
+
+async function addTagToActiveSession() {
+  const active = activeSessionRecord();
+  if (!active) return;
+  const picked = await tagPickerModal(active.session.tags || []);
+  if (!picked) return;
+  const tag = ensureTag(state.tags, picked.name);
+  if (!tag) return;
+  active.session.tags = sortByLibrary(withTag(active.session.tags, tag.name), state.tags);
+  await persist();
+  render();
+}
+
+async function removeSessionTag(sessionId, name) {
+  const found = findSession(sessionId);
+  if (!found) return;
+  found.session.tags = withoutTag(found.session.tags, name);
+  if (tagFilter && tagKey(tagFilter) === tagKey(name) && !visibleSessions(found.repo).length) tagFilter = null;
+  await persist();
+  render();
+}
+
+async function removeTagFromActiveSession() {
+  const active = activeSessionRecord();
+  if (!active?.session.tags?.length) return;
+  const name = await listPickerModal(
+    'Remove which tag from this tab?',
+    active.session.tags.map((t) => ({ label: t, detail: '', value: t }))
+  );
+  if (name) await removeSessionTag(active.session.id, name);
+}
+
+async function pickTagFilter() {
+  const repo = activeRepo();
+  const rows = state.tags.map((t) => ({
+    label: t.name,
+    detail: repo ? pluralize(repo.sessions.filter((s) => hasTag(s.tags, t.name)).length, 'tab') + ' here' : '',
+    value: t.name,
+  }));
+  if (tagFilter) rows.unshift({ label: 'Show all tabs', detail: `clear the “${tagFilter}” filter`, value: '' });
+  const value = await listPickerModal('Show only tabs tagged…', rows);
+  if (value === null) return;
+  setTagFilter(value || null);
+}
+
+function setTagFilter(name) {
+  tagFilter = name;
+  const repo = activeRepo();
+  // Keep the selection on a visible tab so the terminal matches the list.
+  if (repo && name) {
+    const visible = visibleSessions(repo);
+    if (visible.length && !visible.some((s) => s.id === activeSessionId(repo.id))) {
+      selectSession(repo.id, visible[0].id);
+      return;
+    }
+  }
+  render();
+}
+
+async function deleteTagFromList() {
+  const name = await listPickerModal(
+    'Delete which tag from the list?',
+    state.tags.map((t) => ({ label: t.name, detail: pluralize(tagUsageCount(state.repos, t.name), 'tab'), value: t.name }))
+  );
+  if (!name) return;
+  const used = tagUsageCount(state.repos, name);
+  if (used && !(await confirmModal(`Delete tag “${name}”?`, [`It will be removed from ${pluralize(used, 'tab')}.`], 'Delete'))) return;
+  state.tags = state.tags.filter((t) => tagKey(t.name) !== tagKey(name));
+  for (const repo of state.repos) for (const session of repo.sessions) session.tags = withoutTag(session.tags, name);
+  if (tagFilter && tagKey(tagFilter) === tagKey(name)) tagFilter = null;
+  await persist();
+  render();
+}
+
+function renderTagPill(session, name) {
+  const pill = document.createElement('span');
+  pill.className = 'session-tag';
+  pill.style.setProperty('--tag-color', tagColor(state.tags, name));
+  pill.title = `Tag: ${name}`;
+  const label = document.createElement('span');
+  label.textContent = name;
+  const x = document.createElement('button');
+  x.className = 'session-tag-x';
+  x.textContent = '×';
+  x.title = `Remove “${name}”`;
+  // Don't let the press select the row or count toward a rename double-click.
+  x.onmousedown = (e) => e.stopPropagation();
+  x.onclick = (e) => {
+    e.stopPropagation();
+    removeSessionTag(session.id, name);
+  };
+  pill.append(label, x);
+  return pill;
+}
+
 // ---------- render ----------
 function render() {
   renderTopbar();
@@ -1532,7 +1774,26 @@ function renderSidebar() {
     });
   }
 
-  for (const s of repo.sessions) {
+  if (tagFilter) {
+    const banner = document.createElement('div');
+    banner.className = 'tag-filter';
+    const label = document.createElement('span');
+    label.className = 'tag-filter-label';
+    label.append('Showing ');
+    const pill = document.createElement('span');
+    pill.className = 'session-tag';
+    pill.style.setProperty('--tag-color', tagColor(state.tags, tagFilter));
+    pill.textContent = tagFilter;
+    label.append(pill, ` · ${visibleSessions(repo).length}/${repo.sessions.length}`);
+    const clear = document.createElement('button');
+    clear.className = 'tag-filter-clear';
+    clear.textContent = 'Show all';
+    clear.onclick = () => setTagFilter(null);
+    banner.append(label, clear);
+    list.appendChild(banner);
+  }
+
+  for (const s of visibleSessions(repo)) {
     const item = document.createElement('div');
     item.className = 'session' + (s.id === activeSid ? ' active' : '');
     item.dataset.sid = s.id;
@@ -1584,6 +1845,8 @@ function renderSidebar() {
     const meta = document.createElement('div');
     meta.className = 'session-meta';
     meta.title = contextTooltip(s, ctx);
+
+    for (const tagName of s.tags || []) meta.appendChild(renderTagPill(s, tagName));
 
     const branch = document.createElement('span');
     branch.className = 'session-branch';
@@ -1939,7 +2202,7 @@ async function init() {
         api.writeSession(entry.ptyId, seq);
       }
     } else if (action.startsWith('session:')) {
-      const s = repo?.sessions[Number(action.slice(8)) - 1];
+      const s = repo ? visibleSessions(repo)[Number(action.slice(8)) - 1] : null;
       if (s) selectSession(repo.id, s.id);
     }
   });

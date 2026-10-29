@@ -40,3 +40,11 @@ test('saveState should write atomically (no temp file left behind)', () => {
   saveState(dir, defaultState());
   assert.deepEqual(fs.readdirSync(dir), ['state.json']);
 });
+
+test('loadState should keep the tag list, and omit it when absent so defaults get seeded', () => {
+  const dir = tmpDir();
+  saveState(dir, { ...defaultState(), tags: [{ name: 'needs QA', color: '#ffb547' }] });
+  assert.deepEqual(loadState(dir).tags, [{ name: 'needs QA', color: '#ffb547' }]);
+  saveState(dir, defaultState());
+  assert.equal('tags' in loadState(dir), false);
+});
