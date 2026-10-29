@@ -582,7 +582,11 @@ function contextTooltip(session, ctx) {
 }
 
 function updateSessionContext(sessionId, ctx) {
+  // Window focus re-resolves every tab; most come back unchanged. Skipping those
+  // avoids rebuilding the sidebar under the user's cursor for nothing.
+  const unchanged = JSON.stringify(sessionContexts.get(sessionId)) === JSON.stringify(ctx);
   sessionContexts.set(sessionId, ctx);
+  if (unchanged) return;
   renderSidebar();
   renderStatusbar();
 }
@@ -842,6 +846,13 @@ function contextTitle(ctx) {
 
 function commandItems() {
   return [
+    {
+      label: 'Rename Current Tab…',
+      detail: 'Rename the selected vertical tab',
+      keywords: 'rename tab session name title current active',
+      enabled: Boolean(activeSessionRecord()),
+      run: () => renameActiveSession(),
+    },
     {
       label: 'Save Session Snapshot',
       detail: 'Record which pi / Claude session runs in every tab (also taken daily and on quit)',
@@ -1416,6 +1427,46 @@ async function startTerminal(repo, session, { background = false } = {}) {
   return entry;
 }
 
+// The sidebar and topbar are rebuilt wholesale on render (selecting a tab, git/PR
+// refreshes for every tab on window focus, agent titles). If a rebuild lands
+// between press and release, the browser drops the click (and any dblclick).
+// So detect double-clicks from mousedown on the persistent container, keyed by
+// the item's id rather than its DOM node.
+const DOUBLE_CLICK_MS = 500;
+
+function onDoubleClickById(container, idOf, handler) {
+  let last = { id: null, at: 0 };
+  container.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    const id = idOf(e.target);
+    if (!id) return;
+    if (id === last.id && e.timeStamp - last.at <= DOUBLE_CLICK_MS) {
+      last = { id: null, at: 0 };
+      e.preventDefault(); // don't let this press pull focus away from the rename input
+      handler(id);
+    } else {
+      last = { id, at: e.timeStamp };
+    }
+  });
+}
+
+function initDoubleClickRename() {
+  onDoubleClickById(
+    el.sidebar,
+    (target) => target.closest('.session-content') && target.closest('.session')?.dataset.sid,
+    (sid) => {
+      const repo = state.repos.find((r) => r.sessions.some((s) => s.id === sid));
+      if (repo) renameSession(repo.id, sid);
+    }
+  );
+  onDoubleClickById(el.topbar, (target) => target.closest('.chip-label')?.dataset.repoId, renameRepo);
+}
+
+function renameActiveSession() {
+  const active = activeSessionRecord();
+  if (active) renameSession(active.repo.id, active.session.id);
+}
+
 // ---------- render ----------
 function render() {
   renderTopbar();
@@ -1434,8 +1485,8 @@ function renderTopbar() {
     label.className = 'chip-label';
     label.textContent = repo.name;
     label.title = repo.cwd;
+    label.dataset.repoId = repo.id;
     label.onclick = () => selectRepo(repo.id);
-    label.ondblclick = () => renameRepo(repo.id);
 
     const x = document.createElement('button');
     x.className = 'chip-x';
@@ -1529,10 +1580,6 @@ function renderSidebar() {
     name.dataset.sid = s.id;
     name.textContent = s.name;
     name.title = contextTooltip(s, ctx);
-    name.ondblclick = (e) => {
-      e.stopPropagation();
-      renameSession(repo.id, s.id);
-    };
 
     const meta = document.createElement('div');
     meta.className = 'session-meta';
@@ -1817,6 +1864,7 @@ function initResizer() {
 
 // ---------- init ----------
 async function init() {
+  initDoubleClickRename();
   // Route pty output to terminals (registered once, before any session starts).
   api.onData(({ ptyId, data }) => {
     const sessionId = ptyToSession.get(ptyId);
