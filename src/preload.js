@@ -10,8 +10,10 @@ contextBridge.exposeInMainWorld('api', {
   pickFolder: () => ipcRenderer.invoke('dialog:pickFolder'),
   listSessions: () => ipcRenderer.invoke('sessions:live'),
   scanRepos: (parents) => ipcRenderer.invoke('repos:scan', parents),
-  resolveSessionContext: (cwd) => ipcRenderer.invoke('session:resolveContext', cwd),
-  listWorktrees: (repoCwd) => ipcRenderer.invoke('session:listWorktrees', repoCwd),
+  syncWork: (sessions) => ipcRenderer.invoke('work:sync', sessions),
+  refreshWork: () => ipcRenderer.invoke('work:refresh'),
+  workSnapshot: () => ipcRenderer.invoke('work:snapshot'),
+  parseWorkRef: (text) => ipcRenderer.invoke('work:parseRef', text),
   clipWrite: (text) => ipcRenderer.invoke('clipboard:write', text),
   clipRead: () => ipcRenderer.invoke('clipboard:read'),
   clipReadImage: () => ipcRenderer.invoke('clipboard:readImage'),
@@ -28,6 +30,8 @@ contextBridge.exposeInMainWorld('api', {
 
   onData: (cb) => ipcRenderer.on('session:data', (_e, payload) => cb(payload)),
   onExit: (cb) => ipcRenderer.on('session:exit', (_e, payload) => cb(payload)),
-  onExternalContextUpdate: (cb) => ipcRenderer.on('session:externalContextUpdate', (_e, payload) => cb(payload)),
+  onWorkRefs: (cb) => ipcRenderer.on('work:refs', (_e, payload) => cb(payload)),
+  onWorkTickets: (cb) => ipcRenderer.on('work:tickets', (_e, payload) => cb(payload)),
+  onWorkPrs: (cb) => ipcRenderer.on('work:prs', (_e, payload) => cb(payload)),
   onMenu: (cb) => ipcRenderer.on('menu-action', (_e, action) => cb(action)),
 });

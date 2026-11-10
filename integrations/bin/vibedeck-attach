@@ -1,0 +1,41 @@
+#!/usr/bin/env node
+'use strict';
+
+// Attach PRs / tickets to the VibeDeck tab this shell runs in, e.g. a PR a
+// remote agent opened, or a ticket the tab's agent is working on:
+//
+//   vibedeck-attach https://github.com/o/r/pull/12
+//   vibedeck-attach ABC-123            # a ticket id, if a tracker recognises it
+//   vibedeck-attach jira:ABC-123 https://github.com/o/r/pull/13
+//
+// Works from any agent or script running inside a VibeDeck tab (it uses the
+// tab's VIBEDECK_SESSION_SLUG). VibeDeck parses the values with the same rules
+// as ⌘⇧P → "Attach PR or Ticket…".
+
+const fs = require('node:fs');
+const path = require('node:path');
+
+const refs = process.argv.slice(2).map((arg) => arg.trim()).filter(Boolean);
+if (!refs.length || refs.some((r) => r === '-h' || r === '--help')) {
+  process.stdout.write('usage: vibedeck-attach <PR URL | ticket id> [...]\n');
+  process.exit(refs.length ? 0 : 2);
+}
+
+const slug = process.env.VIBEDECK_SESSION_SLUG;
+if (!slug) {
+  process.stderr.write('vibedeck-attach: not running inside a VibeDeck tab (VIBEDECK_SESSION_SLUG is unset)\n');
+  process.exit(1);
+}
+
+const home = process.env.HOME || process.cwd();
+const updatesDir =
+  process.env.VIBEDECK_UPDATES_DIR ||
+  (process.platform === 'darwin'
+    ? path.join(home, 'Library/Application Support/vibedeck/session-updates')
+    : path.join(process.env.XDG_CONFIG_HOME || path.join(home, '.config'), 'vibedeck/session-updates'));
+
+fs.mkdirSync(updatesDir, { recursive: true });
+const file = path.join(updatesDir, `${slug}-${Date.now()}-${process.pid}.json`);
+fs.writeFileSync(`${file}.tmp`, JSON.stringify({ slug, attach: refs, updatedAt: new Date().toISOString() }), 'utf8');
+fs.renameSync(`${file}.tmp`, file);
+process.stdout.write(`VibeDeck: attached ${refs.join(', ')}\n`);

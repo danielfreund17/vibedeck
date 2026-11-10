@@ -6,3 +6,6 @@ build/icon.png
 build/icon.iconset/
 *.log
 .DS_Store
+
+# Local configuration (ticket trackers, resolvers) — see examples/local/
+/local/

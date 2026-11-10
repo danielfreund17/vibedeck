@@ -43,12 +43,21 @@ function resolveShell() {
   return '/bin/sh';
 }
 
+// A GUI-launched app doesn't inherit the shell PATH (it gets /usr/bin:/bin:…);
+// guarantee the common bin dirs so tools (git, gh, agents) resolve — both in
+// our shells and for the main process's own `gh` calls.
+function augmentedPath(current = process.env.PATH) {
+  const extra = [pathJoinHome('.local/bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'];
+  return [...new Set([...extra, ...(current ? current.split(':') : [])])].join(':');
+}
+
+function toolEnv() {
+  return { ...process.env, PATH: augmentedPath() };
+}
+
 function shellEnv({ slug, updatesDir, agentsDir }) {
   const env = { ...process.env };
-  // A GUI-launched app doesn't inherit the shell PATH; guarantee the common
-  // bin dirs so tools (git, brew-installed binaries, agents) resolve.
-  const extra = [pathJoinHome('.local/bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'];
-  env.PATH = [...new Set([...extra, ...(env.PATH ? env.PATH.split(':') : [])])].join(':');
+  env.PATH = augmentedPath(env.PATH);
   env.VIBEDECK_SESSION_SLUG = slug;
   if (updatesDir) env.VIBEDECK_UPDATES_DIR = updatesDir;
   if (agentsDir) env.VIBEDECK_AGENTS_DIR = agentsDir; // pi extension registers its session here
@@ -91,4 +100,4 @@ function listSessions() {
   return Promise.resolve([]);
 }
 
-module.exports = { spawnSession, listSessions };
+module.exports = { spawnSession, listSessions, augmentedPath, toolEnv };

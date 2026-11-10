@@ -15,6 +15,16 @@ import {
   withTag,
   withoutTag,
 } from './tags.js';
+import {
+  buildWorkItems,
+  chipText,
+  chipsFor,
+  detachRef,
+  itemTooltip,
+  mergeRefs,
+  normalizeSessionWork,
+  workListRows,
+} from './work.js';
 
 // VibeDeck renderer. Owns the scope -> session model, renders the two-axis UI,
 // and lazily attaches an xterm <-> pty <-> shell pipe per session on demand.
@@ -33,9 +43,12 @@ let tagFilter = null; // show only tabs carrying this tag (not persisted)
 let liveSlugs = new Set(); // sessions with a shell open right now (none, at launch)
 const busySessionIds = new Set(); // sessions that emitted output recently
 const busyTimers = new Map(); // sessionId -> timer that settles the activity dot
-const sessionContexts = new Map(); // sessionId -> { cwd, git, pr }
-const contextTimers = new Map(); // sessionId -> debounced context refresh timer
-const contextRequests = new Map(); // sessionId -> monotonically increasing request id
+// Work items (see work.js). Refs live on each session; their status comes from
+// the main process (work-tracker.js).
+let workTickets = {}; // "<tracker>:<id>" -> { label, url, title, state, prs, done, error }
+let workStatuses = {}; // PR URL -> { state, isDraft, checks, reviewDecision, title, … } | { error }
+let workInfo = { trackers: [], configFile: null, configErrors: [] };
+let workGhError = null; // last batch-wide `gh` failure (e.g. not installed / not logged in)
 let hostname = ''; // used to ignore a bare-hostname terminal title
 let homedir = ''; // used to prettify paths (~/...)
 let paletteEl = null; // the open command-palette overlay, if any
@@ -66,6 +79,7 @@ function newSlug() {
   return 'tg_' + crypto.randomUUID().replace(/-/g, '').slice(0, 12);
 }
 function persist() {
+  scheduleWorkSync();
   return api.saveState(state);
 }
 
@@ -75,6 +89,7 @@ function persistSoon() {
   if (persistTimer) clearTimeout(persistTimer);
   persistTimer = setTimeout(() => {
     persistTimer = null;
+    scheduleWorkSync();
     api.saveState(state);
   }, 400);
 }
@@ -122,12 +137,10 @@ function applyAutoTitle(session, rawTitle) {
   const parsed = parseAutoTitle(rawTitle);
   if (!parsed) return;
 
-  const found = findSession(session.id);
-  if (parsed.metadata?.cwd && found && !session.worktreeLocked && session.cwdSource !== 'manual') {
-    session.cwd = parsed.metadata.cwd;
-    session.cwdSource = 'agent';
-    scheduleContextRefresh(found.repo, session, 0);
+  if (parsed.metadata?.cwd && parsed.metadata.cwd !== session.cwd) {
+    session.cwd = parsed.metadata.cwd; // where the agent runs (used by snapshots)
     persistSoon();
+    renderStatusbar();
   }
 
   if (isManualName(session)) return;
@@ -161,8 +174,9 @@ function normalizeStateShape() {
     if (!Array.isArray(repo.sessions)) repo.sessions = [];
     for (const session of repo.sessions) {
       if (!session.cwd) session.cwd = repo.cwd;
-      if (!session.cwdSource) session.cwdSource = session.cwd === repo.cwd ? 'default' : 'observed';
-      if (session.worktreeLocked !== true) session.worktreeLocked = session.cwdSource === 'manual';
+      delete session.cwdSource; // retired: worktree guessing / pinning
+      delete session.worktreeLocked;
+      normalizeSessionWork(session);
       if (!session.nameSource) session.nameSource = session.pinned ? 'manual' : 'default';
       session.pinned = session.nameSource === 'manual'; // keep old state readers compatible
       session.tags = normalizeSessionTags(session.tags, state.tags);
@@ -199,20 +213,13 @@ function activeSessionRecord() {
   return repo && session ? { repo, session } : null;
 }
 
-function applyExternalContextUpdate(update) {
-  const found = update?.slug ? findSessionBySlug(update.slug) : activeSessionRecord();
-  if (!found || !update.cwd) return;
-  if (found.session.worktreeLocked && update.source !== 'vibedeck-ui') return;
-  found.session.cwd = update.cwd;
-  found.session.cwdSource = 'manual';
-  if (update.title && !isManualName(found.session)) {
-    found.session.name = update.title;
-    found.session.nameSource = 'manual';
-    found.session.pinned = true;
-  }
+// Refs reported for a tab: by its agent's transcript, or by `vibedeck-attach`.
+function applyWorkRefs({ slug, tickets, prs, manual }) {
+  const found = slug ? findSessionBySlug(slug) : null;
+  if (!found) return;
+  if (!mergeRefs(found.session, { tickets, prs }, { manual: Boolean(manual) })) return;
   persistSoon();
-  scheduleContextRefresh(found.repo, found.session, 0);
-  render();
+  renderWork();
 }
 
 // A tiny text-input modal (Electron doesn't implement window.prompt).
@@ -447,12 +454,11 @@ function mergeSnapshotLayout(plan) {
           name: snapSession.name,
           nameSource: snapSession.nameSource || 'default',
           cwd: snapSession.cwd || repo.cwd,
-          cwdSource: (snapSession.cwd || repo.cwd) === repo.cwd ? 'default' : 'agent',
-          worktreeLocked: false,
           slug: slugTaken ? newSlug() : snapSession.slug,
           pinned: snapSession.nameSource === 'manual',
           tags: normalizeSessionTags(snapSession.tags, state.tags),
         };
+        normalizeSessionWork(session);
         repo.sessions.push(session);
         found = { repo, session };
       }
@@ -555,99 +561,133 @@ function prettyPath(p) {
   return homedir && p && p.startsWith(homedir) ? '~' + p.slice(homedir.length) : p;
 }
 
-function shortenMiddle(text, max = 36) {
-  const s = String(text || '');
-  if (s.length <= max) return s;
-  const keep = Math.max(4, Math.floor((max - 1) / 2));
-  return `${s.slice(0, keep)}…${s.slice(-keep)}`;
+// ---------- work items (tickets + PRs per tab) ----------
+let workSyncTimer = null;
+function scheduleWorkSync() {
+  clearTimeout(workSyncTimer);
+  workSyncTimer = setTimeout(() => {
+    const sessions = (state.repos || []).flatMap((repo) =>
+      repo.sessions.map((s) => ({ slug: s.slug, tickets: s.tickets || [], prs: s.prs || [] }))
+    );
+    api.syncWork(sessions).catch(() => {});
+  }, 150);
 }
 
-function prLabel(pr) {
-  if (!pr || pr.lookupState === 'none') return 'no PR';
-  if (pr.lookupState === 'error') return 'PR unavailable';
-  if (pr.lookupState !== 'found') return 'checking PR…';
-  const state = pr.isDraft ? 'draft' : String(pr.state || '').toLowerCase();
-  return `#${pr.number} ${state}`;
-}
-
-function prClass(pr) {
-  if (!pr || pr.lookupState !== 'found') return pr?.lookupState === 'error' ? 'pr-error' : 'pr-none';
-  if (pr.isDraft) return 'pr-draft';
-  return `pr-${String(pr.state || 'open').toLowerCase()}`;
-}
-
-function gitLabel(ctx) {
-  if (!ctx) return 'checking context…';
-  if (ctx.git?.unknownWorktree) return 'worktree unknown';
-  if (!ctx.git?.isRepo) return 'no git repo';
-  const branch = ctx.git.branch || (ctx.git.shortSha ? `detached ${ctx.git.shortSha}` : 'detached');
-  const dirty = ctx.git.dirty ? ' dirty' : '';
-  const ahead = ctx.git.ahead ? ` ↑${ctx.git.ahead}` : '';
-  const behind = ctx.git.behind ? ` ↓${ctx.git.behind}` : '';
-  return `${shortenMiddle(branch)}${dirty}${ahead}${behind}`;
-}
-
-function contextTooltip(session, ctx) {
-  const lines = [sessionTitle(session), `cwd: ${session.cwd || ''}`];
-  if (ctx?.git?.isRepo) {
-    lines.push(`worktree: ${ctx.git.worktreeRoot}`);
-    lines.push(`branch: ${ctx.git.branch || `detached ${ctx.git.shortSha || ''}`}`);
-    if (ctx.pr?.lookupState === 'found') lines.push(`PR #${ctx.pr.number}: ${ctx.pr.title}`);
-    else lines.push(`PR: ${prLabel(ctx.pr)}`);
-  } else if (ctx) {
-    lines.push('not a git repository');
-  }
-  return lines.filter(Boolean).join('\n');
-}
-
-function updateSessionContext(sessionId, ctx) {
-  // Window focus re-resolves every tab; most come back unchanged. Skipping those
-  // avoids rebuilding the sidebar under the user's cursor for nothing.
-  const unchanged = JSON.stringify(sessionContexts.get(sessionId)) === JSON.stringify(ctx);
-  sessionContexts.set(sessionId, ctx);
-  if (unchanged) return;
+function renderWork() {
   renderSidebar();
   renderStatusbar();
 }
 
-function scheduleContextRefresh(repo, session, delay = 250) {
-  if (!repo || !session) return;
-  const key = session.id;
-  const existing = contextTimers.get(key);
-  if (existing) clearTimeout(existing);
-  contextTimers.set(
-    key,
-    setTimeout(async () => {
-      contextTimers.delete(key);
-      const requestId = (contextRequests.get(key) || 0) + 1;
-      contextRequests.set(key, requestId);
-      const cwd = session.cwd || repo.cwd;
-      try {
-        const ctx = await api.resolveSessionContext({
-          cwd,
-          repoCwd: repo.cwd,
-          cwdSource: session.cwdSource || 'default',
-          sessionName: session.name,
-        });
-        if (contextRequests.get(key) !== requestId) return;
-        if (ctx.cwdSource === 'inferred' && session.cwdSource === 'default' && ctx.cwd && ctx.cwd !== session.cwd) {
-          session.cwd = ctx.cwd;
-          session.cwdSource = 'inferred';
-          persistSoon();
-        }
-        updateSessionContext(key, ctx);
-      } catch {
-        if (contextRequests.get(key) !== requestId) return;
-        updateSessionContext(key, { cwd, git: { isRepo: false }, pr: { lookupState: 'error', message: 'Context lookup failed' } });
-      }
-    }, delay)
-  );
+// Updates arrive on every poll; only redraw (under the user's cursor) on change.
+function withoutFetchedAt(obj) {
+  return JSON.stringify(obj, (key, value) => (key === 'fetchedAt' ? undefined : value));
 }
 
-function refreshAllSessionContexts(delay = 100) {
-  for (const repo of state.repos || []) {
-    for (const session of repo.sessions || []) scheduleContextRefresh(repo, session, delay);
+function applyWorkPrs({ statuses, error }) {
+  const next = { ...workStatuses, ...(statuses || {}) };
+  const changed = withoutFetchedAt(next) !== withoutFetchedAt(workStatuses) || (error || null) !== workGhError;
+  workStatuses = next;
+  workGhError = error || null;
+  if (changed) renderWork();
+}
+
+function applyWorkTickets(tickets) {
+  const next = { ...workTickets, ...(tickets || {}) };
+  if (JSON.stringify(next) === JSON.stringify(workTickets)) return;
+  workTickets = next;
+  renderWork();
+}
+
+let lastWorkRefresh = 0;
+async function refreshWork({ force = false } = {}) {
+  if (!force && Date.now() - lastWorkRefresh < 30 * 1000) return; // focus storms
+  lastWorkRefresh = Date.now();
+  const info = await api.refreshWork().catch(() => null);
+  if (info) workInfo = { trackers: info.trackers || [], configFile: info.configFile, configErrors: info.configErrors || [] };
+  if (force && workInfo.configErrors.length) {
+    await confirmModal('Ticket tracker config has problems', [workInfo.configFile || 'config.json', ...workInfo.configErrors], 'OK');
   }
+}
+
+function sessionWorkItems(session) {
+  return buildWorkItems(session, workTickets, workStatuses);
+}
+
+function openUrl(url) {
+  if (url) void api.openExternalUrl(url).catch(() => {});
+}
+
+async function openWorkList(session) {
+  const rows = workListRows(sessionWorkItems(session));
+  if (workGhError) rows.push({ label: `GitHub status unavailable — ${workGhError}`, detail: '', value: null });
+  const picked = await listPickerModal(`Work in “${session.name}” — ⏎ open`, rows);
+  if (picked?.url) openUrl(picked.url);
+}
+
+function renderWorkChips(container, session, { max, className }) {
+  const items = sessionWorkItems(session);
+  const { shown, more } = chipsFor(items, max);
+  for (const item of shown) {
+    const chip = document.createElement('button');
+    chip.className = `${className} work-${item.tone}`;
+    chip.textContent = chipText(item);
+    const opensDirectly = item.kind === 'pr' || (item.url && !item.prs.length);
+    chip.title = `${itemTooltip(item)}\n\n${opensDirectly ? 'click: open · ⌥click: all work items' : 'click: list work items'}`;
+    // Don't let the press select the row or count toward a rename double-click.
+    chip.onmousedown = (e) => e.stopPropagation();
+    chip.onclick = (e) => {
+      e.stopPropagation();
+      if (opensDirectly && !e.altKey) openUrl(item.url);
+      else openWorkList(session);
+    };
+    container.appendChild(chip);
+  }
+  if (more > 0) {
+    const chip = document.createElement('button');
+    chip.className = `${className} work-more`;
+    chip.textContent = `+${more}`;
+    chip.title = 'Show all work items';
+    chip.onmousedown = (e) => e.stopPropagation();
+    chip.onclick = (e) => {
+      e.stopPropagation();
+      openWorkList(session);
+    };
+    container.appendChild(chip);
+  }
+}
+
+async function attachWorkToActiveSession() {
+  const active = activeSessionRecord();
+  if (!active) return;
+  const trackerHint = workInfo.trackers.length ? ' or ticket id' : '';
+  const text = await promptModal(`Attach a PR URL${trackerHint} to “${active.session.name}”`, '');
+  if (!text) return;
+  const ref = await api.parseWorkRef(text);
+  if (!ref) {
+    const why = workInfo.trackers.length
+      ? 'Not a GitHub PR URL, and no configured tracker recognises it.'
+      : 'Not a GitHub PR URL. (Tickets need a tracker — see “Ticket trackers” in the README.)';
+    await confirmModal('Nothing attached', [why], 'OK');
+    return;
+  }
+  mergeRefs(active.session, ref.kind === 'pr' ? { prs: [ref.url] } : { tickets: [ref.key] }, { manual: true });
+  await persist();
+  renderWork();
+}
+
+async function detachWorkFromActiveSession() {
+  const active = activeSessionRecord();
+  if (!active) return;
+  const rows = sessionWorkItems(active.session).map((item) => ({
+    label: item.title ? `${item.label} — ${item.title}` : item.label,
+    detail: item.kind === 'ticket' ? 'ticket' : 'PR',
+    value: item.key,
+  }));
+  const ref = await listPickerModal('Detach which item from this tab? (it won’t be re-added automatically)', rows);
+  if (!ref) return;
+  detachRef(active.session, ref);
+  await persist();
+  renderWork();
 }
 
 // Fuzzy score: prefix > substring > subsequence; -Infinity means no match.
@@ -866,12 +906,6 @@ async function openPalette() {
   await rescan();
 }
 
-function contextTitle(ctx) {
-  if (ctx?.pr?.lookupState === 'found' && ctx.pr.title) return shortenMiddle(ctx.pr.title, 48);
-  if (ctx?.git?.branch) return shortenMiddle(ctx.git.branch, 48);
-  return 'worktree';
-}
-
 function commandItems() {
   return [
     {
@@ -931,18 +965,32 @@ function commandItems() {
       run: () => pickAndRestoreSnapshot(),
     },
     {
-      label: 'Set Worktree for Active Session…',
-      detail: 'Choose a git worktree and assign it to the selected vertical tab',
-      keywords: 'worktree branch pr cwd set active session',
-      enabled: Boolean(activeSessionRecord()),
-      run: () => setWorktreeForActiveSession(),
+      label: 'Show Work Items…',
+      detail: 'Tickets and PRs this tab worked on — pick one to open it',
+      keywords: 'work items pr pull request ticket issue open list status ci',
+      enabled: Boolean(activeSessionRecord() && sessionWorkItems(activeSessionRecord().session).length),
+      run: () => openWorkList(activeSessionRecord().session),
     },
     {
-      label: 'Refresh Git/PR Status',
-      detail: 'Re-read git branch and GitHub PR status for the selected tab',
-      keywords: 'refresh git branch pr status',
+      label: 'Attach PR or Ticket…',
+      detail: 'Track a PR (URL) or ticket (id) on this tab, e.g. one opened elsewhere',
+      keywords: 'attach add track pr pull request ticket issue work link',
       enabled: Boolean(activeSessionRecord()),
-      run: () => refreshActiveSessionContext(),
+      run: () => attachWorkToActiveSession(),
+    },
+    {
+      label: 'Detach PR or Ticket…',
+      detail: 'Stop tracking a PR or ticket on this tab',
+      keywords: 'detach remove untrack pr pull request ticket issue work',
+      enabled: Boolean(activeSessionRecord() && sessionWorkItems(activeSessionRecord().session).length),
+      run: () => detachWorkFromActiveSession(),
+    },
+    {
+      label: 'Refresh PR & Ticket Status',
+      detail: 'Re-check GitHub PR status and re-run ticket trackers now',
+      keywords: 'refresh pr pull request ticket status ci checks work',
+      enabled: true,
+      run: () => refreshWork({ force: true }),
     },
   ];
 }
@@ -1055,163 +1103,6 @@ function openCommandPalette() {
   input.focus();
 }
 
-async function setWorktreeForActiveSession() {
-  const active = activeSessionRecord();
-  if (!active) return;
-
-  const worktrees = await api.listWorktrees(active.repo.cwd);
-  if (!worktrees.length) {
-    const picked = await api.pickFolder();
-    if (!picked) return;
-    active.session.cwd = picked.path;
-    active.session.cwdSource = 'manual';
-    active.session.worktreeLocked = true;
-    if (!isManualName(active.session)) {
-      active.session.name = picked.name;
-      active.session.nameSource = 'manual';
-      active.session.pinned = true;
-    }
-    await persist();
-    scheduleContextRefresh(active.repo, active.session, 0);
-    render();
-    return;
-  }
-
-  await openWorktreePicker(active, worktrees);
-}
-
-function openWorktreePicker(active, worktrees) {
-  return new Promise((resolve) => {
-    if (paletteEl) return resolve(null);
-
-    const overlay = document.createElement('div');
-    overlay.className = 'modal-overlay palette-overlay';
-    overlay.innerHTML = `
-      <div class="palette">
-        <input class="palette-input" type="text" placeholder="Choose worktree for active session…" spellcheck="false" />
-        <div class="palette-list"></div>
-      </div>`;
-    paletteEl = overlay;
-
-    const input = overlay.querySelector('.palette-input');
-    const listEl = overlay.querySelector('.palette-list');
-    let items = [];
-    let sel = 0;
-
-    function itemText(ctx) {
-      return [ctx.cwd, ctx.git?.branch, ctx.pr?.title, prLabel(ctx.pr)].filter(Boolean).join(' ');
-    }
-
-    function computeItems() {
-      const q = input.value.trim().toLowerCase();
-      items = !q
-        ? worktrees.slice()
-        : worktrees
-            .map((ctx) => ({ ctx, score: fuzzyScore(itemText(ctx).toLowerCase(), q) }))
-            .filter((item) => item.score > -Infinity)
-            .sort((a, b) => b.score - a.score)
-            .map((item) => item.ctx);
-      if (sel >= items.length) sel = Math.max(0, items.length - 1);
-    }
-
-    function highlight() {
-      [...listEl.children].forEach((child, i) => child.classList.toggle('active', i === sel));
-      listEl.children[sel]?.scrollIntoView({ block: 'nearest' });
-    }
-
-    function renderList() {
-      listEl.innerHTML = '';
-      if (!items.length) {
-        const empty = document.createElement('div');
-        empty.className = 'palette-empty';
-        empty.textContent = 'No matching worktree.';
-        listEl.appendChild(empty);
-        return;
-      }
-      items.forEach((ctx, i) => {
-        const row = document.createElement('div');
-        row.className = 'palette-item worktree-item' + (i === sel ? ' active' : '');
-        const name = document.createElement('span');
-        name.className = 'pi-name';
-        name.textContent = `${ctx.isMainWorktree ? 'main' : contextTitle(ctx)}`;
-        const detail = document.createElement('span');
-        detail.className = 'pi-path';
-        detail.textContent = `${gitLabel(ctx)} · ${prLabel(ctx.pr)} · ${prettyPath(ctx.cwd)}`;
-        row.append(name, detail);
-        row.onmouseenter = () => {
-          sel = i;
-          highlight();
-        };
-        row.onclick = () => choose(ctx);
-        listEl.appendChild(row);
-      });
-    }
-
-    function close(value = null) {
-      overlay.remove();
-      paletteEl = null;
-      document.removeEventListener('keydown', onKey, true);
-      resolve(value);
-    }
-
-    async function choose(ctx) {
-      active.session.cwd = ctx.cwd;
-      active.session.cwdSource = 'manual';
-      active.session.worktreeLocked = true;
-      if (!isManualName(active.session)) {
-        active.session.name = contextTitle(ctx);
-        active.session.nameSource = 'manual';
-        active.session.pinned = true;
-      }
-      sessionContexts.set(active.session.id, ctx);
-      await persist();
-      render();
-      close(ctx);
-    }
-
-    function onKey(e) {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        close();
-      } else if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        if (items.length) {
-          sel = (sel + 1) % items.length;
-          highlight();
-        }
-      } else if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        if (items.length) {
-          sel = (sel - 1 + items.length) % items.length;
-          highlight();
-        }
-      } else if (e.key === 'Enter') {
-        e.preventDefault();
-        if (items[sel]) choose(items[sel]);
-      }
-    }
-
-    input.addEventListener('input', () => {
-      computeItems();
-      renderList();
-    });
-    overlay.addEventListener('mousedown', (e) => {
-      if (e.target === overlay) close();
-    });
-    document.addEventListener('keydown', onKey, true);
-    document.body.appendChild(overlay);
-    computeItems();
-    renderList();
-    input.focus();
-  });
-}
-
-async function refreshActiveSessionContext() {
-  const active = activeSessionRecord();
-  if (!active) return;
-  scheduleContextRefresh(active.repo, active.session, 0);
-}
-
 async function renameRepo(repoId) {
   const repo = state.repos.find((r) => r.id === repoId);
   if (!repo) return;
@@ -1244,10 +1135,11 @@ async function addSession(repoId) {
     name: `session ${repo.sessions.length + 1}`,
     nameSource: 'default',
     cwd: repo.cwd,
-    cwdSource: 'default',
-    worktreeLocked: false,
     slug: newSlug(),
     pinned: false,
+    tickets: [],
+    prs: [],
+    hiddenWork: [],
   };
   repo.sessions.push(session);
   state.activeRepoId = repoId;
@@ -1285,12 +1177,6 @@ async function removeSession(repoId, sessionId) {
 
 // Tear down the local xterm; optionally kill the session's shell too.
 async function destroySession(session, killShell) {
-  const pendingContext = contextTimers.get(session.id);
-  if (pendingContext) clearTimeout(pendingContext);
-  contextTimers.delete(session.id);
-  contextRequests.delete(session.id);
-  sessionContexts.delete(session.id);
-
   const entry = terminals.get(session.id);
   if (entry) {
     try {
@@ -1311,18 +1197,12 @@ async function destroySession(session, killShell) {
 // ---------- selection ----------
 async function selectRepo(repoId) {
   state.activeRepoId = repoId;
-  const repo = state.repos.find((r) => r.id === repoId);
-  const session = repo?.sessions.find((s) => s.id === activeSessionId(repoId));
-  if (repo && session) scheduleContextRefresh(repo, session, 0);
   await persist();
   render();
 }
 async function selectSession(repoId, sessionId) {
   state.activeRepoId = repoId;
   state.activeSessionByRepo[repoId] = sessionId;
-  const repo = state.repos.find((r) => r.id === repoId);
-  const session = repo?.sessions.find((s) => s.id === sessionId);
-  if (repo && session) scheduleContextRefresh(repo, session, 0);
   await persist();
   render();
 }
@@ -1825,9 +1705,6 @@ function renderSidebar() {
       moveSession(repo.id, draggedSessionId, s.id, placeAfter);
     });
 
-    const ctx = sessionContexts.get(s.id);
-    if (!ctx && !contextTimers.has(s.id)) scheduleContextRefresh(repo, s, 50);
-
     const dot = document.createElement('span');
     dot.className = 'dot' + (liveSlugs.has(s.slug) ? ' live' : '') + (busySessionIds.has(s.id) ? ' busy' : '');
     dot.dataset.sid = s.id;
@@ -1840,33 +1717,16 @@ function renderSidebar() {
     name.className = 'session-name';
     name.dataset.sid = s.id;
     name.textContent = s.name;
-    name.title = contextTooltip(s, ctx);
+    name.title = `${sessionTitle(s)}\ncwd: ${prettyPath(s.cwd || repo.cwd)}`;
 
     const meta = document.createElement('div');
     meta.className = 'session-meta';
-    meta.title = contextTooltip(s, ctx);
 
     for (const tagName of s.tags || []) meta.appendChild(renderTagPill(s, tagName));
+    renderWorkChips(meta, s, { max: 2, className: 'session-work' });
 
-    const branch = document.createElement('span');
-    branch.className = 'session-branch';
-    branch.textContent = gitLabel(ctx);
-    meta.appendChild(branch);
-
-    if (ctx?.git?.isRepo) {
-      const pr = document.createElement('button');
-      pr.className = `session-pr ${prClass(ctx.pr)}`;
-      pr.textContent = prLabel(ctx.pr);
-      pr.title = ctx.pr?.lookupState === 'found' ? `${ctx.pr.title}\n${ctx.pr.url}` : prLabel(ctx.pr);
-      pr.disabled = ctx.pr?.lookupState !== 'found' || !ctx.pr.url;
-      pr.onclick = (e) => {
-        e.stopPropagation();
-        if (ctx.pr?.url) void api.openExternalUrl(ctx.pr.url).catch(() => {});
-      };
-      meta.appendChild(pr);
-    }
-
-    content.append(name, meta);
+    content.append(name);
+    if (meta.childElementCount) content.append(meta);
 
     const x = document.createElement('button');
     x.className = 'session-x';
@@ -1901,8 +1761,6 @@ function renderStatusbar() {
   }
 
   el.statusbar.classList.remove('empty-status');
-  const ctx = sessionContexts.get(session.id);
-  if (!ctx && !contextTimers.has(session.id)) scheduleContextRefresh(repo, session, 50);
 
   const parts = [];
   const repoName = document.createElement('span');
@@ -1916,23 +1774,10 @@ function renderStatusbar() {
   cwd.title = session.cwd || repo.cwd;
   parts.push(cwd);
 
-  const branch = document.createElement('span');
-  branch.className = 'status-branch';
-  branch.textContent = gitLabel(ctx);
-  branch.title = ctx?.git?.isRepo ? ctx.git.worktreeRoot : '';
-  parts.push(branch);
-
-  if (ctx?.git?.isRepo) {
-    const pr = document.createElement('button');
-    pr.className = `status-pr ${prClass(ctx.pr)}`;
-    pr.textContent = prLabel(ctx.pr);
-    pr.disabled = ctx.pr?.lookupState !== 'found' || !ctx.pr.url;
-    pr.title = ctx.pr?.lookupState === 'found' ? `${ctx.pr.title}\n${ctx.pr.url}` : prLabel(ctx.pr);
-    pr.onclick = () => {
-      if (ctx.pr?.url) void api.openExternalUrl(ctx.pr.url).catch(() => {});
-    };
-    parts.push(pr);
-  }
+  const work = document.createElement('span');
+  work.className = 'status-work';
+  renderWorkChips(work, session, { max: 4, className: 'status-work-chip' });
+  if (work.childElementCount) parts.push(work);
 
   parts.forEach((part, index) => {
     if (index > 0) {
@@ -2038,14 +1883,9 @@ function trackSessionCwd(entry, data, sessionId) {
   const lastSt = buf.lastIndexOf('\x1b\\');
   entry.oscTail = lastStart > Math.max(lastBel, lastSt) ? buf.slice(lastStart, lastStart + 512) : '';
 
-  if (!latestCwd || found.session.worktreeLocked || found.session.cwdSource === 'manual') return;
-  const changed = found.session.cwd !== latestCwd;
-  const becameObserved = found.session.cwdSource !== 'observed';
+  if (!latestCwd || found.session.cwd === latestCwd) return;
   found.session.cwd = latestCwd;
-  found.session.cwdSource = 'observed';
-  if (!changed && !becameObserved) return;
   persistSoon();
-  scheduleContextRefresh(found.repo, found.session, 100);
   renderStatusbar();
 }
 
@@ -2076,7 +1916,7 @@ function trackKittyKeyboard(entry, data) {
 }
 
 window.addEventListener('resize', fitActive);
-window.addEventListener('focus', () => refreshAllSessionContexts(0));
+window.addEventListener('focus', () => refreshWork());
 
 // Draggable divider: resize the sidebar, persist the width, refit live.
 function applySidebarWidth() {
@@ -2157,7 +1997,9 @@ async function init() {
     const entry = sessionId && terminals.get(sessionId);
     if (entry) entry.term.write('\r\n\x1b[90m[process exited — reopen to restart]\x1b[0m\r\n');
   });
-  api.onExternalContextUpdate((update) => applyExternalContextUpdate(update));
+  api.onWorkRefs((payload) => applyWorkRefs(payload));
+  api.onWorkTickets((tickets) => applyWorkTickets(tickets));
+  api.onWorkPrs((payload) => applyWorkPrs(payload));
 
   // Shortcuts routed from the native menu (main process).
   api.onMenu(async (action) => {
@@ -2219,7 +2061,18 @@ async function init() {
   if (loaded && Array.isArray(loaded.repos)) state = loaded;
   normalizeStateShape();
   liveSlugs = new Set(await api.listSessions());
-  refreshAllSessionContexts();
+  try {
+    const snap = await api.workSnapshot();
+    if (snap) {
+      workTickets = snap.tickets || {};
+      workStatuses = snap.statuses || {};
+      workGhError = snap.error || null;
+      workInfo = { trackers: snap.trackers || [], configFile: snap.configFile, configErrors: snap.configErrors || [] };
+    }
+  } catch {
+    /* non-fatal: chips fill in as updates arrive */
+  }
+  scheduleWorkSync();
   applySidebarWidth();
   initResizer();
   render();
