@@ -1,0 +1,21 @@
+{
+  "trackers": [
+    {
+      "name": "jira",
+      "label": "{id}",
+      "url": "https://your-company.atlassian.net/browse/{id}",
+      "id": "^([A-Z][A-Z0-9]+-\\d+)$",
+      "detect": {
+        "command": [
+          "\\bjira\\s+issue\\s+(?:view|move|edit|assign|comment\\s+add)\\s+([A-Z][A-Z0-9]+-\\d+)",
+          "\\bgit\\s+(?:checkout\\s+-b|switch\\s+-c|worktree\\s+add\\s+\\S+\\s+-b)\\s+(?:[\\w.-]+/)?([A-Z][A-Z0-9]+-\\d+)"
+        ],
+        "output": [
+          { "when": "\\bjira\\s+issue\\s+create\\b", "match": "/browse/([A-Z][A-Z0-9]+-\\d+)" }
+        ]
+      },
+      "resolve": "./resolve-jira.js",
+      "refreshSeconds": 300
+    }
+  ]
+}

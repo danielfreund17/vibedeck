@@ -26,6 +26,20 @@ rm -rf "$DEST"
 cp -R "$APP" "$DEST"
 xattr -cr "$DEST" 2>/dev/null || true
 
+# The installed app reads its local config (ticket trackers) from
+# <userData>/local; point that at this checkout's gitignored local/ so edits
+# there apply without a rebuild.
+USER_DATA="$HOME/Library/Application Support/vibedeck"
+if [ -d "$ROOT/local" ]; then
+  mkdir -p "$USER_DATA"
+  if [ -L "$USER_DATA/local" ] || [ ! -e "$USER_DATA/local" ]; then
+    ln -sfn "$ROOT/local" "$USER_DATA/local"
+    echo "linked local config: $USER_DATA/local -> $ROOT/local"
+  else
+    echo "note: $USER_DATA/local exists and is not a symlink; leaving it alone"
+  fi
+fi
+
 echo "launching…"
 open "$DEST"
 echo "✓ VibeDeck installed to /Applications and launched"

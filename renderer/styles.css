@@ -241,51 +241,64 @@ body {
   cursor: pointer;
 }
 
-.session-branch {
+/* ---- work items (tickets + PRs a tab worked on) ---- */
+.session-work,
+.status-work-chip {
+  --work-color: #9fb5ff;
+  flex-shrink: 1;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.session-pr,
-.status-pr {
-  border: 1px solid transparent;
+  max-width: 150px;
+  border: 1px solid color-mix(in srgb, var(--work-color) 30%, transparent);
   border-radius: 999px;
-  padding: 0 5px;
-  background: rgba(138, 144, 160, 0.12);
-  color: var(--fg-dim);
+  padding: 0 6px;
+  background: color-mix(in srgb, var(--work-color) 13%, transparent);
+  color: var(--work-color);
   font: inherit;
   white-space: nowrap;
-}
-.session-pr:not(:disabled),
-.status-pr:not(:disabled) {
+  overflow: hidden;
+  text-overflow: ellipsis;
   cursor: pointer;
 }
-.session-pr.pr-open,
-.status-pr.pr-open {
-  color: #9fb5ff;
-  background: rgba(109, 140, 255, 0.14);
+.status-work-chip {
+  max-width: 220px;
+  font-size: 11px;
 }
-.session-pr.pr-draft,
-.status-pr.pr-draft {
-  color: #c7a4ff;
-  background: rgba(178, 132, 255, 0.14);
+.work-failing,
+.work-error {
+  --work-color: var(--danger);
 }
-.session-pr.pr-merged,
-.status-pr.pr-merged {
-  color: var(--live);
-  background: rgba(61, 220, 132, 0.14);
+.work-changes {
+  --work-color: #ffb454;
 }
-.session-pr.pr-closed,
-.status-pr.pr-closed,
-.session-pr.pr-error,
-.status-pr.pr-error {
-  color: var(--danger);
-  background: rgba(255, 107, 107, 0.12);
+.work-pending {
+  --work-color: #e5d36a;
 }
-.session-pr.pr-none,
-.status-pr.pr-none {
-  color: #6f7686;
+.work-open,
+.work-ticket {
+  --work-color: #9fb5ff;
+}
+.work-approved {
+  --work-color: #7fd8c4;
+}
+.work-draft {
+  --work-color: #c7a4ff;
+}
+.work-merged,
+.work-done {
+  --work-color: var(--live);
+  opacity: 0.75;
+}
+.work-closed,
+.work-unknown,
+.work-more {
+  --work-color: #8a90a0;
+}
+.status-work {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
 }
 .dot {
   position: relative;
@@ -452,8 +465,7 @@ body.resizing .terminals {
   color: var(--fg);
   font-weight: 600;
 }
-.status-cwd,
-.status-branch {
+.status-cwd {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -461,15 +473,9 @@ body.resizing .terminals {
 .status-cwd {
   max-width: 42%;
 }
-.status-branch {
-  color: #b8becd;
-}
 .status-sep {
   color: #555c69;
   flex-shrink: 0;
-}
-.status-pr {
-  font-size: 11px;
 }
 
 /* ---- modal ---- */

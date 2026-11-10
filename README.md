@@ -2,7 +2,7 @@
 
 A lean macOS terminal built for running many coding agents at once — organized in two dimensions, with every tab showing what's going on in it.
 
-![VibeDeck: scopes in the top bar, tagged session tabs with branch and PR status in the sidebar](docs/images/sidebar-tags.png)
+![VibeDeck: scopes in the top bar, tagged session tabs with PR and ticket status in the sidebar](docs/images/sidebar-tags.png)
 
 - **Scopes** (top bar) — one per project/folder. Switching scopes swaps which sessions you see.
 - **Sessions** (sidebar) — terminal tabs within the active scope. Run whatever you like in them: a shell, a coding agent (Claude Code, pi, …), a dev server.
@@ -16,7 +16,7 @@ Each session is your login shell running on its own pty, wired straight to the t
 | | |
 |---|---|
 | 🏷️ **Session tags** | Mark tabs `in progress`, `needs review`, `needs QA`, `blocked`, … or your own tags; filter the sidebar by tag |
-| 🌿 **Worktree, branch & PR on every tab** | Each tab follows its shell's `cd` and shows the git branch and GitHub PR state |
+| 🔀 **PRs & tickets on every tab** | Each tab shows the PRs its agent opened (with live CI / review state) and the tickets it worked on |
 | 💾 **Agent session snapshots** | Remembers which pi / Claude Code conversation runs in which tab and brings them all back after a quit or reboot |
 | ⌨️ **Command palette** | ⌘⇧P for every action; ⌘P to fuzzy-find and open repos |
 | ✍️ **Auto-named tabs** | Tabs name themselves from the terminal title — with the pi extension, from the first meaningful prompt (double-click to rename) |
@@ -42,11 +42,50 @@ When a dozen agents are running, the question is *which ones need me?* Tags answ
 - **Delete Tag from List…** — retire a tag everywhere (asks first if tabs still use it).
 - Tags are saved with your layout and in agent session snapshots, so they survive restarts and restores.
 
-## Worktree, branch & PR tracking
+## PRs & tickets per tab
 
-Every tab shows the **branch** its shell is on and the state of that branch's **GitHub PR** (open, draft, merged, closed — or `no PR`). VibeDeck tracks the shell's current directory through prompt integration (OSC 7), so the badges follow the session across `cd`s and into git worktrees. Agents can also report the worktree they're working in (see the pi companion extension below). PR data comes from your local `gh` CLI when it's installed and authenticated; otherwise the badge quietly shows as unavailable.
+An agent tab rarely maps to one branch: it `cd`s into worktrees inside subshells, opens PRs in three repos, or delegates work that lands as a PR somewhere else. So VibeDeck doesn't guess from the tab's directory — it tracks **what the agent actually did**:
 
-⌘⇧P → **Set Worktree for Active Session…** pins a tab to a worktree by hand; **Refresh Git/PR Status** forces an update.
+- **PRs** — every PR the agent opened (`gh pr create`, or a GitHub MCP `create_pull_request` tool), read from the agent's own transcript (pi and Claude Code).
+- **Tickets** — ids your [ticket trackers](#ticket-trackers) recognise in the agent's shell commands and their output (optional).
+
+Each tab gets up to two chips with live status, most urgent first — `CI ✗`, `changes requested`, `CI …`, `open`, `approved`, `draft`, then `merged` / `closed`. A ticket chip rolls up its PRs: `ABC-123 · 3 PRs · CI ✗`. Click a chip to open it (tickets with PRs open the list); finished work only shows when nothing live is left.
+
+- Status comes from your local `gh` CLI (one batched GraphQL call, every 2 min for open PRs and right after `gh pr merge/ready/…` or `git push` in that tab).
+- ⌘⇧P → **Show Work Items…**, **Attach PR or Ticket…** (e.g. a PR a remote agent opened), **Detach PR or Ticket…** (it won't come back automatically), **Refresh PR & Ticket Status**.
+- From inside a tab — any agent or script — `vibedeck-attach <PR URL | ticket id> …` does the same as **Attach** (`integrations/bin/vibedeck-attach`; put it on your `PATH`).
+
+### Ticket trackers
+
+Ticket support is configured per machine, in a **local config folder that's never committed** (like a `.env`). Copy the example and edit it:
+
+```bash
+cp -R examples/local local    # gitignored; `npm start` reads ./local
+```
+
+`npm run install-app` links `~/Library/Application Support/vibedeck/local` to the checkout's `local/`, so the installed app uses it too (or set `VIBEDECK_CONFIG_DIR`). `local/config.json`:
+
+```jsonc
+{
+  "trackers": [
+    {
+      "name": "jira",                       // [a-z0-9_-]; refs are stored as "jira:ABC-123"
+      "label": "{id}",                      // chip text
+      "url": "https://acme.atlassian.net/browse/{id}",
+      "id": "^([A-Z][A-Z0-9]+-\\d+)$",      // what "Attach…" accepts (first capture group = id)
+      "detect": {
+        "command": ["\\bjira\\s+issue\\s+view\\s+([A-Z][A-Z0-9]+-\\d+)"],   // regexes on shell commands
+        "output": [{ "when": "\\bjira\\s+issue\\s+create\\b", "match": "/browse/([A-Z][A-Z0-9]+-\\d+)" }]
+      },
+      "resolve": "./resolve-jira.js",       // optional, relative to the config folder
+      "watch": ["~/.cache/my-tool/state.json"], // optional: re-resolve when these change
+      "refreshSeconds": 300
+    }
+  ]
+}
+```
+
+A **resolver** is any executable (`.js` files run with VibeDeck's bundled Node) that turns ids into details. It gets `{"tickets": ["ABC-1", …]}` on stdin and prints `{"tickets": {"ABC-1": {"title": "…", "state": "In Review", "url": "…", "prs": ["https://github.com/o/r/pull/7"], "done": false}}}` — every field optional. `prs` lets a ticket pull in PRs that were opened elsewhere (by CI, a teammate, a remote agent). Config errors show up in the app's log and never break the terminal; without a config, VibeDeck just tracks PRs.
 
 ## Agent session snapshots
 
@@ -66,7 +105,7 @@ Quitting VibeDeck (or rebooting) kills the shells — but VibeDeck remembers whi
 Two palettes, both fuzzy-searched:
 
 - **⌘P — repos.** Register a **parent folder** like `~/git-repos` once, then fuzzy-search every git repo under it and press Enter to open it as a scope.
-- **⌘⇧P — commands.** Tags, snapshots, rename, worktree, git/PR refresh — everything that isn't a keyboard shortcut lives here.
+- **⌘⇧P — commands.** Tags, snapshots, rename, PRs & tickets — everything that isn't a keyboard shortcut lives here.
 
 ![Command palette filtered to "tag"](docs/images/command-palette.png)
 
@@ -88,10 +127,11 @@ npm start
 
 Open a repo as a scope with `⌘P` (or the `+` in the top bar), or open any folder manually. Then add sessions with **+ New session** in the sidebar (or ⌘T).
 
-Optional: symlink the pi companion extension so pi sessions get auto-named tabs, worktree reporting, and snapshot support:
+Optional: symlink the pi companion extension so pi sessions get auto-named tabs, snapshot support, and PR/ticket tracking:
 
 ```bash
 ln -s "$PWD/integrations/pi/vibedeck-session-title.ts" ~/.pi/agent/extensions/
+ln -s "$PWD/integrations/bin/vibedeck-attach" ~/.local/bin/   # optional: attach PRs/tickets from a tab
 ```
 
 ## Build a macOS app
@@ -121,15 +161,14 @@ Electron renderer (UI)  ──IPC──►  main process  ──►  node-pty  �
 
 - Each session is a login shell on a dedicated pty; the terminal (xterm.js) talks straight to it — no multiplexer in between.
 - The app owns the scope→session model (including the tag list and each tab's tags) in `state.json` in Electron's userData dir. That layout persists; the shells don't.
-- VibeDeck tracks each session's current directory via terminal OSC 7 prompt integration, so worktree branch/PR badges follow the session even after `cd`.
-- GitHub PR badges use the local `gh` CLI when it is installed and authenticated; failures degrade to a subtle unavailable state.
-- The optional `integrations/pi/vibedeck-session-title.ts` companion extension lets pi emit contextual terminal titles (so VibeDeck can auto-name tabs from the first meaningful prompt), report its worktree, and register its session for snapshots.
+- The main process tails each tab's agent transcript (found the same way as for [snapshots](#agent-session-snapshots)) for PRs and tickets; the renderer stores them per tab in `state.json`. GitHub status uses your `gh` CLI (VibeDeck adds Homebrew paths, since apps launched from Finder get a bare `PATH`); failures show on the chip instead of hiding it.
+- The optional `integrations/pi/vibedeck-session-title.ts` companion extension lets pi emit contextual terminal titles (so VibeDeck can auto-name tabs from the first meaningful prompt) and register its session for snapshots and PR/ticket tracking.
 - VibeDeck speaks the [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) so modified keys (like Shift+Enter) reach apps unambiguously, and ⌘V pastes a clipboard **image** as a temp-file path so agents can attach it.
 
 ## Keyboard
 
 - `⌘P` — repo palette (search repos under your parent folders, open as a scope)
-- `⌘⇧P` — command palette (tags, snapshots, rename, worktree, …)
+- `⌘⇧P` — command palette (tags, snapshots, rename, PRs & tickets, …)
 - `⌘T` — new session in the active scope (or `Ctrl`+`Shift`+backtick, VS Code style) · `⌘W` — close the active session
 - `⌘1`–`⌘9` — jump to a session in the active scope (within the tag filter, if one is on)
 - `⌘⇧[` / `⌘⇧]` — previous / next scope (the top bar)

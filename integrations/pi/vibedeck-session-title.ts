@@ -70,21 +70,6 @@ function fallbackTitle(ctx: ExtensionContext): string {
   return basename(ctx.cwd) || 'session';
 }
 
-function defaultUpdatesDir(): string {
-  return join(homedir(), 'Library/Application Support/vibedeck/session-updates');
-}
-
-function writeVibeDeckUpdate(cwd: string, title: string): void {
-  const slug = process.env.VIBEDECK_SESSION_SLUG || null;
-  const updatesDir = process.env.VIBEDECK_UPDATES_DIR || defaultUpdatesDir();
-  mkdirSync(updatesDir, { recursive: true });
-  writeFileSync(
-    join(updatesDir, `${slug || 'active'}-${Date.now()}.json`),
-    JSON.stringify({ slug, source: 'pi', cwd, title, updatedAt: new Date().toISOString() }),
-    'utf8'
-  );
-}
-
 // Register this pi process's open conversation so VibeDeck snapshots can
 // re-launch it later (`pi --session <id>`). Only inside a VibeDeck tab.
 function registryFile(): string | null {
@@ -119,23 +104,13 @@ function unregisterSession(): void {
   if (file) rmSync(file, { force: true });
 }
 
-function emitVibeDeckTitle(ctx: ExtensionContext, title: string, options: { writeUpdate?: boolean } = {}): void {
-  if (options.writeUpdate) writeVibeDeckUpdate(ctx.cwd, title);
+function emitVibeDeckTitle(ctx: ExtensionContext, title: string): void {
   const metadata = encodeMetadata({ source: 'pi', cwd: ctx.cwd, title });
   ctx.ui.setTitle(`pi · ${title} ⟦vd:${metadata}⟧`);
 }
 
 export default function (pi: ExtensionAPI) {
   let generated = false;
-
-  pi.registerCommand('update-worktree', {
-    description: 'Update VibeDeck tab context from this pi session cwd (usage: /update-worktree [title])',
-    handler: async (args, ctx) => {
-      const title = args.trim() || pi.getSessionName() || fallbackTitle(ctx);
-      emitVibeDeckTitle(ctx, title, { writeUpdate: true });
-      ctx.ui.notify(`VibeDeck worktree context updated: ${title}`, 'info');
-    },
-  });
 
   pi.on('session_start', async (_event, ctx) => {
     registerSession(ctx);

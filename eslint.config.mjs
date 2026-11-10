@@ -4,11 +4,11 @@ import globals from 'globals';
 // Plain JS, no type checker: lint exists mainly to catch undefined references
 // and dead code before they ship (e.g. a helper deleted but still called).
 export default [
-  { ignores: ['node_modules/', 'dist/', 'out/', 'renderer/vendor/'] },
+  { ignores: ['node_modules/', 'dist/', 'out/', 'renderer/vendor/', 'local/'] },
   js.configs.recommended,
   {
     // Electron main process, preload, build scripts, tests: CommonJS on Node.
-    files: ['src/**/*.js', 'scripts/**/*.js', 'test/**/*.js'],
+    files: ['src/**/*.js', 'scripts/**/*.js', 'test/**/*.js', 'examples/**/*.js'],
     languageOptions: { ecmaVersion: 2023, sourceType: 'commonjs', globals: globals.node },
   },
   {

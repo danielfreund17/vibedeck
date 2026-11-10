@@ -1,7 +1,6 @@
 'use strict';
 
 const { app, BrowserWindow, ipcMain, dialog, Menu, clipboard, shell: electronShell } = require('electron');
-const { execFile } = require('child_process');
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
@@ -10,6 +9,7 @@ const state = require('./state');
 const shell = require('./shell');
 const snap = require('./snapshot');
 const store = require('./snapshot-store');
+const { createWorkTracker } = require('./work-tracker');
 
 // Keep dev (`npm start`) and the packaged .app pointed at the same state/config.
 // VIBEDECK_USER_DATA points a dev/test run at a throwaway state dir instead.
@@ -33,6 +33,23 @@ function sessionUpdatesDir() {
 
 function agentRegistryDir() {
   return store.agentRegistryDir(userDataDir());
+}
+
+// Local, uncommitted configuration (ticket trackers): $VIBEDECK_CONFIG_DIR, else
+// the repo's gitignored local/ when run from source (`npm start`), else
+// <userData>/local for the installed app (install-app.sh symlinks it to the
+// repo's local/). See examples/local/.
+function localConfigDir() {
+  if (process.env.VIBEDECK_CONFIG_DIR) return process.env.VIBEDECK_CONFIG_DIR;
+  if (!app.isPackaged) return path.join(app.getAppPath(), 'local');
+  return path.join(userDataDir(), 'local');
+}
+
+// ---- session work tracking (tickets + PRs per tab; see work-tracker.js) ----
+let workTracker = null;
+
+function sendToRenderer(channel, payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
 }
 
 // ---- session snapshots (which agent conversation runs in which tab) ----
@@ -92,255 +109,6 @@ function scanRepos(parentFolders) {
   }
   out.sort((a, b) => a.name.localeCompare(b.name));
   return out;
-}
-
-function execText(command, args, options = {}) {
-  return new Promise((resolve, reject) => {
-    execFile(
-      command,
-      args,
-      { timeout: options.timeout || 5000, maxBuffer: 1024 * 1024, cwd: options.cwd },
-      (error, stdout, stderr) => {
-        if (error) {
-          error.stderr = stderr;
-          reject(error);
-          return;
-        }
-        resolve(String(stdout || '').trim());
-      }
-    );
-  });
-}
-
-async function git(cwd, args) {
-  return execText('git', ['-C', cwd, ...args], { timeout: 5000 });
-}
-
-async function tryGit(cwd, args) {
-  try {
-    return await git(cwd, args);
-  } catch {
-    return null;
-  }
-}
-
-function parseRemoteUrl(raw) {
-  const remote = String(raw || '').trim();
-  if (!remote) return null;
-
-  let match = remote.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/);
-  if (match) return { owner: match[1], repo: match[2], url: `https://github.com/${match[1]}/${match[2]}` };
-
-  match = remote.match(/^https:\/\/github\.com\/([^/]+)\/(.+?)(?:\.git)?$/);
-  if (match) return { owner: match[1], repo: match[2], url: `https://github.com/${match[1]}/${match[2]}` };
-
-  match = remote.match(/^ssh:\/\/git@github\.com\/([^/]+)\/(.+?)(?:\.git)?$/);
-  if (match) return { owner: match[1], repo: match[2], url: `https://github.com/${match[1]}/${match[2]}` };
-
-  return null;
-}
-
-function parseBranchStatus(statusText) {
-  const lines = String(statusText || '').split('\n').filter(Boolean);
-  const header = lines.find((line) => line.startsWith('##')) || '';
-  const dirty = lines.some((line) => !line.startsWith('##'));
-  const ahead = Number(header.match(/ahead (\d+)/)?.[1] || 0);
-  const behind = Number(header.match(/behind (\d+)/)?.[1] || 0);
-  return { dirty, ahead, behind };
-}
-
-function parseWorktrees(porcelain) {
-  const worktrees = [];
-  let current = null;
-  for (const line of String(porcelain || '').split('\n')) {
-    if (!line.trim()) {
-      if (current) worktrees.push(current);
-      current = null;
-      continue;
-    }
-    if (line.startsWith('worktree ')) current = { path: line.slice('worktree '.length), branch: null, head: null };
-    else if (current && line.startsWith('HEAD ')) current.head = line.slice('HEAD '.length);
-    else if (current && line.startsWith('branch refs/heads/')) current.branch = line.slice('branch refs/heads/'.length);
-  }
-  if (current) worktrees.push(current);
-  return worktrees;
-}
-
-function tokens(text) {
-  return String(text || '')
-    .toLowerCase()
-    .replace(/^[πp]i\s*-\s*/i, '')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .split(/\s+/)
-    .filter((token) => token.length > 2 && !['session', 'dirty', 'fix', 'feat', 'feature', 'chat', 'cxllm'].includes(token));
-}
-
-function scoreWorktree(sessionName, candidateText) {
-  const queryTokens = tokens(sessionName);
-  if (!queryTokens.length) return 0;
-  const haystack = String(candidateText || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ');
-  let score = 0;
-  for (const token of queryTokens) {
-    if (haystack.includes(token)) score += token.length >= 6 ? 3 : 2;
-  }
-  const phrase = queryTokens.join(' ');
-  if (phrase && haystack.includes(phrase)) score += 5;
-  return score;
-}
-
-const prCache = new Map();
-const PR_CACHE_TTL_MS = 60 * 1000;
-
-async function resolvePrContext(remote, branch, headSha) {
-  if (!remote || !branch) return { lookupState: 'none' };
-
-  const cacheKey = `${remote.owner}/${remote.repo}:${branch}:${headSha || ''}`;
-  const cached = prCache.get(cacheKey);
-  if (cached && Date.now() - cached.fetchedAt < PR_CACHE_TTL_MS) return cached.value;
-
-  let value;
-  try {
-    const output = await execText(
-      'gh',
-      [
-        'pr',
-        'list',
-        '--repo',
-        `${remote.owner}/${remote.repo}`,
-        '--head',
-        branch,
-        '--state',
-        'all',
-        '--json',
-        'number,state,isDraft,title,url,headRefName,baseRefName,mergedAt,closedAt,updatedAt',
-        '--limit',
-        '20',
-      ],
-      { timeout: 8000 }
-    );
-    const prs = JSON.parse(output || '[]');
-    const exact = prs.filter((pr) => pr.headRefName === branch);
-    const pr = (exact.length ? exact : prs).sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))[0];
-    value = pr
-      ? {
-          lookupState: 'found',
-          number: pr.number,
-          state: pr.state,
-          isDraft: Boolean(pr.isDraft),
-          title: pr.title || '',
-          url: pr.url || '',
-          updatedAt: pr.updatedAt || null,
-        }
-      : { lookupState: 'none' };
-  } catch (error) {
-    value = { lookupState: 'error', message: error.code === 'ENOENT' ? 'GitHub CLI not found' : 'PR lookup failed' };
-  }
-
-  prCache.set(cacheKey, { fetchedAt: Date.now(), value });
-  return value;
-}
-
-async function resolveGitContextForCwd(cwd, cwdSource = 'observed') {
-  const requestedCwd = String(cwd || os.homedir());
-  const resolvedCwd = fs.existsSync(requestedCwd) ? requestedCwd : os.homedir();
-
-  const worktreeRoot = await tryGit(resolvedCwd, ['rev-parse', '--show-toplevel']);
-  if (!worktreeRoot) {
-    return { cwd: resolvedCwd, cwdSource, git: { isRepo: false }, pr: { lookupState: 'none' } };
-  }
-
-  const [commonGitDir, branchRaw, headSha, shortSha, statusText, remoteRaw] = await Promise.all([
-    tryGit(worktreeRoot, ['rev-parse', '--git-common-dir']),
-    tryGit(worktreeRoot, ['branch', '--show-current']),
-    tryGit(worktreeRoot, ['rev-parse', 'HEAD']),
-    tryGit(worktreeRoot, ['rev-parse', '--short=8', 'HEAD']),
-    tryGit(worktreeRoot, ['status', '--porcelain=v1', '--branch']),
-    tryGit(worktreeRoot, ['remote', 'get-url', 'origin']),
-  ]);
-
-  const branch = branchRaw || null;
-  const remote = parseRemoteUrl(remoteRaw);
-  const branchStatus = parseBranchStatus(statusText);
-  const pr = await resolvePrContext(remote, branch, headSha);
-
-  return {
-    cwd: resolvedCwd,
-    cwdSource,
-    git: {
-      isRepo: true,
-      worktreeRoot,
-      commonGitDir: commonGitDir || null,
-      repoName: path.basename(worktreeRoot),
-      branch,
-      headSha: headSha || null,
-      shortSha: shortSha || null,
-      remote,
-      ...branchStatus,
-    },
-    pr,
-  };
-}
-
-async function inferWorktreeContext(repoCwd, sessionName) {
-  const porcelain = await tryGit(repoCwd, ['worktree', 'list', '--porcelain']);
-  const worktrees = parseWorktrees(porcelain).filter((wt) => wt.path && wt.path !== repoCwd);
-  if (!worktrees.length) return null;
-
-  const remoteRaw = await tryGit(repoCwd, ['remote', 'get-url', 'origin']);
-  const remote = parseRemoteUrl(remoteRaw);
-  const candidates = await Promise.all(
-    worktrees.map(async (wt) => {
-      const pr = await resolvePrContext(remote, wt.branch, wt.head);
-      const text = [wt.branch, wt.path, pr.lookupState === 'found' ? pr.title : ''].filter(Boolean).join(' ');
-      return { wt, pr, score: scoreWorktree(sessionName, text) };
-    })
-  );
-
-  candidates.sort((a, b) => b.score - a.score);
-  const best = candidates[0];
-  const next = candidates[1];
-  if (!best || best.score < 2 || (next && best.score === next.score)) return null;
-
-  const ctx = await resolveGitContextForCwd(best.wt.path, 'inferred');
-  return { ...ctx, pr: best.pr.lookupState === 'found' ? best.pr : ctx.pr };
-}
-
-async function resolveSessionContext(input) {
-  const options = typeof input === 'object' && input !== null ? input : { cwd: input };
-  const cwd = options.cwd || os.homedir();
-  const repoCwd = options.repoCwd || cwd;
-  const cwdSource = options.cwdSource || 'observed';
-
-  if (cwdSource === 'default' && repoCwd && cwd === repoCwd) {
-    const inferred = await inferWorktreeContext(repoCwd, options.sessionName || '');
-    if (inferred) return inferred;
-
-    const worktrees = parseWorktrees(await tryGit(repoCwd, ['worktree', 'list', '--porcelain']));
-    if (worktrees.length > 1) {
-      return {
-        cwd: repoCwd,
-        cwdSource: 'default',
-        git: { isRepo: false, unknownWorktree: true, worktreeCount: worktrees.length - 1 },
-        pr: { lookupState: 'none' },
-      };
-    }
-  }
-
-  return resolveGitContextForCwd(cwd, cwdSource);
-}
-
-async function listWorktreeContexts(repoCwd) {
-  const root = await tryGit(repoCwd, ['rev-parse', '--show-toplevel']);
-  if (!root) return [];
-  const worktrees = parseWorktrees(await tryGit(root, ['worktree', 'list', '--porcelain']));
-  const contexts = await Promise.all(
-    worktrees.map(async (worktree) => {
-      const ctx = await resolveGitContextForCwd(worktree.path, 'manual');
-      return { ...ctx, isMainWorktree: worktree.path === root };
-    })
-  );
-  contexts.sort((a, b) => Number(b.isMainWorktree) - Number(a.isMainWorktree) || String(a.cwd).localeCompare(String(b.cwd)));
-  return contexts;
 }
 
 function createWindow() {
@@ -518,6 +286,14 @@ function buildMenu() {
 app.whenReady().then(() => {
   createWindow();
   buildMenu();
+  workTracker = createWorkTracker({
+    configDir: localConfigDir(),
+    registryDir: agentRegistryDir(),
+    liveShells,
+    send: sendToRenderer,
+    env: shell.toolEnv(),
+  });
+  workTracker.start();
   startSessionUpdateWatcher();
   startDailySnapshots();
   app.on('activate', () => {
@@ -537,6 +313,7 @@ app.on('before-quit', () => {
     safeTakeSnapshot('quit');
   }
   if (dailySnapshotTimer) clearInterval(dailySnapshotTimer);
+  workTracker?.stop();
   try {
     sessionUpdateWatcher?.close();
   } catch {
@@ -561,8 +338,13 @@ function readSessionUpdate(fileName) {
     } catch {
       return;
     }
-    if (!update || typeof update.slug !== 'string' || !update.cwd) return;
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('session:externalContextUpdate', update);
+    // `vibedeck-attach` drops { slug, attach: ["<ticket id>" | "<PR URL>", …] }.
+    if (update && typeof update.slug === 'string' && Array.isArray(update.attach) && workTracker) {
+      const refs = update.attach.map((text) => workTracker.parseRef(String(text))).filter(Boolean);
+      const tickets = refs.filter((r) => r.kind === 'ticket').map((r) => r.key);
+      const prs = refs.filter((r) => r.kind === 'pr').map((r) => r.url);
+      if (tickets.length || prs.length) sendToRenderer('work:refs', { slug: update.slug, tickets, prs, manual: true });
+    }
     try {
       fs.unlinkSync(file);
     } catch {
@@ -662,9 +444,11 @@ ipcMain.handle('sessions:live', () => shell.listSessions());
 // ---- repo discovery under registered parent folders ----
 ipcMain.handle('repos:scan', (_e, parentFolders) => scanRepos(parentFolders));
 
-// ---- session intelligence ----
-ipcMain.handle('session:resolveContext', (_e, cwd) => resolveSessionContext(cwd));
-ipcMain.handle('session:listWorktrees', (_e, repoCwd) => listWorktreeContexts(repoCwd));
+// ---- session work tracking ----
+ipcMain.handle('work:sync', (_e, sessions) => workTracker?.sync(sessions));
+ipcMain.handle('work:refresh', () => workTracker?.refresh({ force: true }));
+ipcMain.handle('work:snapshot', () => workTracker?.snapshot() || null);
+ipcMain.handle('work:parseRef', (_e, text) => workTracker?.parseRef(String(text || '')) || null);
 
 // ---- sessions ----
 // ---- snapshots ----
